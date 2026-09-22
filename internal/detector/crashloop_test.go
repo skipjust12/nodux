@@ -16,7 +16,7 @@ func TestCrashLoopDetector_TriggersAfterThreshold(t *testing.T) {
 		t.Fatalf("expected no issue on first sighting, got %+v", issue)
 	}
 
-	// Три рестарта подряд, укладывающиеся в окно.
+	// Three restarts in a row, all within the window.
 	for i, restarts := range []int{1, 2} {
 		now = now.Add(time.Second)
 		snap.RestartCount = restarts
@@ -35,7 +35,7 @@ func TestCrashLoopDetector_TriggersAfterThreshold(t *testing.T) {
 		t.Errorf("expected restart count 3, got %d", issue.Container.RestartCount)
 	}
 
-	// Повторный Check с тем же RestartCount не должен алертить снова.
+	// A repeated Check with the same RestartCount must not alert again.
 	if issue := d.Check(snap); issue != nil {
 		t.Fatalf("expected no duplicate issue for same restart count, got %+v", issue)
 	}
@@ -57,7 +57,7 @@ func TestCrashLoopDetector_OldRestartsExpireOutsideWindow(t *testing.T) {
 	snap.RestartCount = 2
 	d.Check(snap)
 
-	// Уходим за пределы окна — старые два рестарта должны "истечь".
+	// Move past the window — the earlier two restarts should have expired.
 	now = now.Add(2 * time.Minute)
 	snap.RestartCount = 3
 	if issue := d.Check(snap); issue != nil {

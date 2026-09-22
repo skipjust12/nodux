@@ -5,18 +5,19 @@ import (
 	"time"
 )
 
-// CrashLoopDetector срабатывает, если контейнер перезапустился больше
-// threshold раз за скользящее окно window.
+// CrashLoopDetector fires when a container has restarted more than
+// threshold times within the sliding window.
 //
-// Docker не хранит историю рестартов, только суммарный RestartCount с
-// момента создания контейнера — поэтому детектор сам восстанавливает
-// историю: на каждом опросе смотрит на прирост RestartCount и запоминает
-// момент опроса как время рестарта (точность до интервала опроса).
+// Docker doesn't keep a restart history, only a cumulative RestartCount
+// since the container was created — so the detector reconstructs the
+// history itself: on every poll it looks at the increase in
+// RestartCount and records the poll time as the restart time (accurate
+// only to within the poll interval).
 type CrashLoopDetector struct {
 	threshold int
 	window    time.Duration
 	state     map[string]*crashLoopState
-	now       func() time.Time // для тестируемости
+	now       func() time.Time // overridable for tests
 }
 
 type crashLoopState struct {
@@ -41,8 +42,8 @@ func (d *CrashLoopDetector) Check(s ContainerSnapshot) *Issue {
 
 	st, ok := d.state[s.ID]
 	if !ok {
-		// Первый раз видим контейнер — просто запоминаем точку отсчёта,
-		// прошлые рестарты до старта демона нам не известны.
+		// First time we see this container — just record the baseline;
+		// restarts that happened before the daemon started are unknown to us.
 		d.state[s.ID] = &crashLoopState{
 			lastRestartCount: s.RestartCount,
 			lastAlertedCount: -1,
@@ -71,7 +72,7 @@ func (d *CrashLoopDetector) Check(s ContainerSnapshot) *Issue {
 		return nil
 	}
 	if st.lastAlertedCount == s.RestartCount {
-		// Уже сигнализировали об этой серии рестартов, ждём следующего рестарта.
+		// Already alerted on this run of restarts, wait for the next one.
 		return nil
 	}
 	st.lastAlertedCount = s.RestartCount

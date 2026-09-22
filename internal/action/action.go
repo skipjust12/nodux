@@ -1,7 +1,7 @@
-// Package action определяет контракт для реакций на обнаруженные проблемы.
-// Сейчас есть только ConsoleAction (печать в stdout), но интерфейс задуман
-// так, чтобы позже добавить действия вроде отправки в Slack/webhook/restart
-// без изменения движка.
+// Package action defines the contract for reacting to detected
+// problems. Right now there's only ConsoleAction (print to stdout), but
+// the interface is meant to let us add actions like Slack/webhook/restart
+// later without touching the engine.
 package action
 
 import (

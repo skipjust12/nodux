@@ -8,7 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config описывает содержимое config.yaml.
+// Config describes the contents of config.yaml.
 type Config struct {
 	PollIntervalSeconds int             `yaml:"poll_interval_seconds"`
 	Docker              DockerConfig    `yaml:"docker"`
@@ -31,9 +31,9 @@ type CrashLoopConfig struct {
 	WindowMinutes    int  `yaml:"window_minutes"`
 }
 
-// LLMConfig — задел на будущее: включение опционального LLM-слоя для
-// классификации неоднозначных срабатываний. Сейчас поле только читается
-// и прокидывается в NoopClassifier, реальной логики за ним нет.
+// LLMConfig is groundwork for the future: enabling an optional LLM layer
+// for classifying ambiguous detector hits. For now the field is only
+// read and passed to NoopClassifier — there's no real logic behind it yet.
 type LLMConfig struct {
 	Enabled bool `yaml:"enabled"`
 }
@@ -46,8 +46,8 @@ func (c *CrashLoopConfig) Window() time.Duration {
 	return time.Duration(c.WindowMinutes) * time.Minute
 }
 
-// Load читает и валидирует конфиг из указанного файла, подставляя
-// дефолты для отсутствующих полей.
+// Load reads and validates the config from the given file, filling in
+// defaults for any fields that were left unset.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

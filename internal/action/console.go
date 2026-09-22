@@ -9,8 +9,8 @@ import (
 	"github.com/skipjust12/nodux/internal/detector"
 )
 
-// ConsoleAction печатает обнаруженную проблему в stdout одной JSON-строкой,
-// чтобы позже её можно было забрать куда угодно (journald, Loki, файл, ...).
+// ConsoleAction prints a detected problem to stdout as a single JSON
+// line, so it can later be shipped anywhere (journald, Loki, a file, ...).
 type ConsoleAction struct{}
 
 func NewConsole() *ConsoleAction { return &ConsoleAction{} }

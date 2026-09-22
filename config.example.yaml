@@ -1,24 +1,24 @@
-# Интервал опроса Docker/Podman сокета.
+# How often to poll the Docker/Podman socket.
 poll_interval_seconds: 15
 
 docker:
-  # Docker Desktop / обычный Docker на Linux:
+  # Docker Desktop / plain Docker on Linux:
   socket_path: /var/run/docker.sock
-  # Podman (rootless, пример для Linux):
+  # Podman (rootless, example for Linux):
   # socket_path: /run/user/1000/podman/podman.sock
 
-# Имена контейнеров, которые никогда не проверяются.
+# Container names that are never checked.
 exclude_containers: []
   # - some-noisy-container
 
 detectors:
   crashloop:
     enabled: true
-    # Сработать, если контейнер перезапустился restart_threshold раз
-    # за последние window_minutes минут.
+    # Fire when a container has restarted restart_threshold times
+    # within the last window_minutes.
     restart_threshold: 3
     window_minutes: 5
 
-# Заглушка под опциональный LLM-слой (пока ничего не делает).
+# Stub for the optional future LLM layer (does nothing yet).
 llm:
   enabled: false
