@@ -1,7 +1,7 @@
-// Package dockerclient — минимальный клиент Docker Engine API поверх
-// unix-сокета. Реализует только то, что нужно nodux: список контейнеров,
-// inspect и получение хвоста логов. Совместим и с Docker, и с Podman
-// (у обоих Docker-совместимый REST API на unix-сокете).
+// Package dockerclient is a minimal Docker Engine API client over a
+// unix socket. It only implements what nodux needs: listing containers,
+// inspecting them, and fetching a tail of logs. Works with both Docker
+// and Podman, since both expose a Docker-compatible REST API on a socket.
 package dockerclient
 
 import (
@@ -55,8 +55,9 @@ func (c *Client) do(ctx context.Context, method, path string) (*http.Response, e
 	return resp, nil
 }
 
-// Ping проверяет доступность демона. Используется для явной проверки
-// соединения перед опросом, чтобы отличать "демон недоступен" от прочих ошибок.
+// Ping checks whether the daemon is reachable. Used as an explicit
+// connectivity check before polling, so "daemon unreachable" can be
+// told apart from other errors.
 func (c *Client) Ping(ctx context.Context) error {
 	resp, err := c.do(ctx, http.MethodGet, "/_ping")
 	if err != nil {
@@ -66,7 +67,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// ListContainers возвращает все контейнеры (включая остановленные).
+// ListContainers returns all containers, including stopped ones.
 func (c *Client) ListContainers(ctx context.Context) ([]ContainerSummary, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/containers/json?all=true")
 	if err != nil {
@@ -81,7 +82,7 @@ func (c *Client) ListContainers(ctx context.Context) ([]ContainerSummary, error)
 	return out, nil
 }
 
-// InspectContainer возвращает подробное состояние контейнера.
+// InspectContainer returns detailed state for a single container.
 func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerInspect, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/containers/"+id+"/json")
 	if err != nil {
@@ -96,8 +97,8 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerIns
 	return &out, nil
 }
 
-// ContainerLogs возвращает не более tail последних непустых строк лога
-// (stdout+stderr вперемешку, как их отдаёт демон).
+// ContainerLogs returns up to tail of the last non-empty log lines
+// (stdout+stderr interleaved, in the order the daemon emits them).
 func (c *Client) ContainerLogs(ctx context.Context, id string, tail int, tty bool) ([]string, error) {
 	path := fmt.Sprintf("/containers/%s/logs?stdout=true&stderr=true&tail=%d", id, tail)
 	resp, err := c.do(ctx, http.MethodGet, path)
@@ -130,9 +131,9 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, tail int, tty boo
 	return lines, nil
 }
 
-// demuxLogs разбирает мультиплексированный формат логов Docker: каждый
-// фрейм — 8-байтный заголовок (1 байт тип потока, 3 нулевых, 4 байта
-// big-endian длина) и следом payload такой длины.
+// demuxLogs parses Docker's multiplexed log stream format: each frame
+// is an 8-byte header (1 stream-type byte, 3 zero bytes, 4 big-endian
+// length bytes) followed by a payload of that length.
 func demuxLogs(r io.Reader) (string, error) {
 	var buf bytes.Buffer
 	header := make([]byte, 8)

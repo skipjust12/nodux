@@ -1,65 +1,68 @@
 # nodux
 
-Лёгкий self-hosted демон для VPS с Docker/Podman: детектит типовые
-проблемы у контейнеров чистой детерминированной логикой (без LLM) —
-`docker inspect` / exit codes / restart count. Сейчас реализован
-детектор **crashloop**; архитектура рассчитана на то, что детекторов и
-действий станет больше.
+A lightweight self-hosted daemon for VPS boxes running Docker/Podman:
+detects common container problems with pure deterministic logic (no
+LLM) — `docker inspect` / exit codes / restart count. Currently ships
+one detector, **crashloop**; the architecture is built so more
+detectors and actions can be added.
 
-## Как это устроено
+## How it's built
 
-- `internal/dockerclient` — свой минимальный клиент Docker Engine API
-  поверх unix-сокета (без docker SDK), совместим и с Docker, и с Podman.
-- `internal/detector` — интерфейс `Detector` + `CrashLoopDetector`.
-- `internal/action` — интерфейс `Action` + `ConsoleAction` (печать
-  найденной проблемы JSON-строкой в stdout).
-- `internal/llm` — заглушка `Classifier`/`NoopClassifier`, точка
-  расширения под будущий опциональный LLM-слой для классификации
-  неоднозначных срабатываний. Сейчас ничего не делает.
-- `internal/engine` — poll-loop: опрашивает контейнеры, гоняет их через
-  детекторы, при срабатывании подтягивает последние 20 строк логов и
-  раздаёт issue по действиям. Обрыв связи с Docker сокетом не роняет
-  демон — опрос ретраится с экспоненциальным backoff (1s → 30s).
+- `internal/dockerclient` — a minimal Docker Engine API client over a
+  unix socket (no docker SDK dependency), compatible with both Docker
+  and Podman.
+- `internal/detector` — the `Detector` interface + `CrashLoopDetector`.
+- `internal/action` — the `Action` interface + `ConsoleAction` (prints
+  each detected problem as a JSON line to stdout).
+- `internal/llm` — a `Classifier`/`NoopClassifier` stub, the extension
+  point for a future optional LLM layer that classifies ambiguous
+  detector hits. Currently a no-op.
+- `internal/engine` — the poll loop: polls containers, runs them
+  through the detectors, fetches the last 20 log lines on a hit, and
+  dispatches the issue to every action. A broken connection to the
+  Docker socket doesn't crash the daemon — polling retries with
+  exponential backoff (1s → 30s).
 
-## Запуск локально
+## Running locally
 
 ```sh
 cp config.example.yaml config.yaml
-# при необходимости поправьте socket_path под Docker Desktop/Podman
+# adjust socket_path for Docker Desktop/Podman if needed
 
 go run ./cmd/nodux --config config.yaml
 ```
 
-Для Podman (rootless, Linux) сначала поднимите Docker-совместимый API:
+For Podman (rootless, Linux), start the Docker-compatible API first:
 
 ```sh
 podman system service --time=0 unix:///run/user/$(id -u)/podman/podman.sock &
 ```
 
-и укажите этот путь в `docker.socket_path`.
+and point `docker.socket_path` at that socket.
 
-## Проверка на тестовом контейнере
+## Testing against a real container
 
-Запустите контейнер, который падает почти сразу после старта:
+Start a container that crashes right after boot:
 
 ```sh
 docker run -d --name crasher --restart=always busybox sh -c 'echo boom; exit 1'
 ```
 
-Через несколько перезапусков (порог и окно берутся из
-`detectors.crashloop` в конфиге) в stdout демона появится JSON-строка вида:
+After a few restarts (threshold and window come from
+`detectors.crashloop` in the config), the daemon's stdout will print a
+JSON line like:
 
 ```json
 {"timestamp":"2026-09-22T15:40:00Z","detector":"crashloop","severity":"critical","message":"container restarted 3 times in the last 5m0s","container_id":"...","container_name":"crasher","restart_count":3,"last_exit_code":1,"logs":["boom","boom","boom"]}
 ```
 
-Уберите тестовый контейнер по завершении:
+Clean up the test container when done:
 
 ```sh
 docker rm -f crasher
 ```
 
-## Тесты
+## Tests
 
 ```sh
 go test ./...

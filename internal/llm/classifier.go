@@ -1,9 +1,9 @@
-// Package llm — точка расширения под опциональный LLM-слой. Задача LLM в
-// будущем: разбирать неоднозначные срабатывания детекторов (когда чистой
-// эвристики недостаточно, чтобы понять серьёзность/причину) и обогащать
-// Issue классификацией. Пока это чистая заглушка без сетевых вызовов —
-// движок дергает Classify после каждого сработавшего детектора, но
-// NoopClassifier ничего не делает.
+// Package llm is the extension point for an optional future LLM layer.
+// Its eventual job: triage ambiguous detector hits (when plain
+// heuristics aren't enough to judge severity/cause) and enrich the
+// Issue with a classification. For now it's a pure stub with no network
+// calls — the engine calls Classify after every detector hit, but
+// NoopClassifier does nothing.
 package llm
 
 import (
@@ -21,7 +21,7 @@ type NoopClassifier struct{}
 func NewNoopClassifier() *NoopClassifier { return &NoopClassifier{} }
 
 func (n *NoopClassifier) Classify(_ context.Context, _ detector.Issue) error {
-	// TODO(llm): здесь будет вызов LLM для классификации неоднозначных
-	// срабатываний. Пока намеренно no-op.
+	// TODO(llm): call an LLM here to classify ambiguous detector hits.
+	// Intentionally a no-op for now.
 	return nil
 }

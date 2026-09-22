@@ -1,5 +1,5 @@
-// Package engine связывает docker-клиент, детекторы, действия и
-// LLM-заглушку в один поллинг-цикл.
+// Package engine wires the docker client, detectors, actions, and the
+// LLM stub together into a single poll loop.
 package engine
 
 import (
@@ -51,9 +51,9 @@ func New(
 	}
 }
 
-// Run крутит поллинг-цикл до отмены ctx. Ошибки соединения с Docker
-// сокетом не приводят к падению демона — они логируются, и опрос
-// повторяется с экспоненциальным backoff.
+// Run drives the poll loop until ctx is cancelled. Docker socket
+// connection errors don't crash the daemon — they're logged, and
+// polling is retried with exponential backoff.
 func (e *Engine) Run(ctx context.Context) {
 	backoff := initialBackoff
 

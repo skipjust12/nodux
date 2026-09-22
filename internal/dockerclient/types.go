@@ -1,6 +1,6 @@
 package dockerclient
 
-// ContainerSummary — элемент ответа GET /containers/json.
+// ContainerSummary is one entry of the GET /containers/json response.
 type ContainerSummary struct {
 	ID     string   `json:"Id"`
 	Names  []string `json:"Names"`
@@ -8,7 +8,8 @@ type ContainerSummary struct {
 	Status string   `json:"Status"`
 }
 
-// ContainerInspect — ответ GET /containers/{id}/json (только нужные нам поля).
+// ContainerInspect is the GET /containers/{id}/json response (only the
+// fields we actually need).
 type ContainerInspect struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
