@@ -1,6 +1,7 @@
 // Package dockerclient is a minimal Docker Engine API client over a
 // unix socket. It only implements what nodux needs: listing containers,
-// inspecting them, and fetching a tail of logs. Works with both Docker
+// inspecting them, fetching a tail of logs, and following the event
+// stream. Works with both Docker
 // and Podman, since both expose a Docker-compatible REST API on a socket.
 package dockerclient
 
@@ -9,10 +10,13 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +24,9 @@ import (
 type Client struct {
 	socketPath string
 	http       *http.Client
+	// stream has no overall timeout: /events is a long-lived response
+	// that's only ever ended by ctx cancellation or the daemon.
+	stream *http.Client
 }
 
 func New(socketPath string) *Client {
@@ -35,24 +42,51 @@ func New(socketPath string) *Client {
 			Transport: transport,
 			Timeout:   10 * time.Second,
 		},
+		stream: &http.Client{Transport: transport},
 	}
 }
 
 func (c *Client) do(ctx context.Context, method, path string) (*http.Response, error) {
+	return c.doWith(ctx, c.http, method, path)
+}
+
+func (c *Client) doWith(ctx context.Context, hc *http.Client, method, path string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("docker socket %s: %w", c.socketPath, err)
 	}
 	if resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("docker API %s %s: status %d: %s", method, path, resp.StatusCode, string(body))
+		return nil, &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return resp, nil
+}
+
+// APIError is a non-2xx response from the daemon.
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("docker API %s %s: status %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+// IsGone reports whether err means the container no longer exists (404)
+// or is being removed (409), which is routine for docker run --rm.
+func IsGone(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusNotFound || apiErr.StatusCode == http.StatusConflict
 }
 
 // Ping checks whether the daemon is reachable. Used as an explicit
@@ -129,6 +163,46 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, tail int, tty boo
 		}
 	}
 	return lines, nil
+}
+
+// Events follows the daemon's container event stream, calling fn for
+// every event of the given actions, and blocks until ctx is cancelled or
+// the stream breaks. If since is non-zero, the daemon first replays
+// buffered events from that point on, which lets the caller resume after
+// a reconnect without a gap.
+func (c *Client) Events(ctx context.Context, since time.Time, actions []string, fn func(Event)) error {
+	filters, err := json.Marshal(map[string][]string{
+		"type":  {"container"},
+		"event": actions,
+	})
+	if err != nil {
+		return err
+	}
+	q := url.Values{"filters": {string(filters)}}
+	if !since.IsZero() {
+		q.Set("since", strconv.FormatInt(since.Unix(), 10)+"."+fmt.Sprintf("%09d", since.Nanosecond()))
+	}
+
+	resp, err := c.doWith(ctx, c.stream, http.MethodGet, "/events?"+q.Encode())
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var ev Event
+		if err := dec.Decode(&ev); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err == io.EOF {
+				return fmt.Errorf("event stream closed by daemon")
+			}
+			return fmt.Errorf("decode event: %w", err)
+		}
+		fn(ev)
+	}
 }
 
 // demuxLogs parses Docker's multiplexed log stream format: each frame

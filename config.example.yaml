@@ -1,6 +1,10 @@
 # How often to poll the Docker/Podman socket.
 poll_interval_seconds: 15
 
+# Don't repeat an alert from the same detector for the same container
+# (by name) within this many minutes. 0 disables the cooldown.
+alert_cooldown_minutes: 10
+
 docker:
   # Docker Desktop / plain Docker on Linux:
   socket_path: /var/run/docker.sock
@@ -12,12 +16,28 @@ exclude_containers: []
   # - some-noisy-container
 
 detectors:
+  # Polled: restart count grows too fast.
   crashloop:
     enabled: true
     # Fire when a container has restarted restart_threshold times
     # within the last window_minutes.
     restart_threshold: 3
     window_minutes: 5
+
+  # Polled: the container's HEALTHCHECK reports "unhealthy".
+  unhealthy:
+    enabled: true
+
+  # Event-driven: the kernel OOM killer hit the container's memory limit.
+  oom:
+    enabled: true
+
+  # Event-driven: the main process exited with a non-zero code on its
+  # own. Stops/kills issued through docker (stop, kill, restart, rm -f,
+  # compose down) are never reported.
+  exit:
+    enabled: true
+    ignore_exit_codes: [0]
 
 # Stub for the optional future LLM layer (does nothing yet).
 llm:

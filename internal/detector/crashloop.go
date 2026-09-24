@@ -79,9 +79,13 @@ func (d *CrashLoopDetector) Check(s ContainerSnapshot) *Issue {
 
 	return &Issue{
 		Detector:   d.Name(),
-		Severity:   "critical",
+		Severity:   SeverityCritical,
 		Message:    fmt.Sprintf("container restarted %d times in the last %s", len(st.events), d.window),
 		Container:  s,
 		DetectedAt: now,
 	}
+}
+
+func (d *CrashLoopDetector) Forget(containerID string) {
+	delete(d.state, containerID)
 }
