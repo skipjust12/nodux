@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/skipjust12/nodux/internal/action"
 	"github.com/skipjust12/nodux/internal/config"
@@ -41,6 +42,12 @@ func main() {
 	if cfg.Detectors.Unhealthy.Enabled {
 		detectors = append(detectors, detector.NewUnhealthyDetector())
 	}
+	if cfg.Detectors.Memory.Enabled {
+		detectors = append(detectors, detector.NewMemoryDetector(
+			cfg.Detectors.Memory.ThresholdPercent,
+			cfg.Detectors.Memory.For(),
+		))
+	}
 
 	var eventDetectors []detector.EventDetector
 	if cfg.Detectors.OOM.Enabled {
@@ -57,14 +64,27 @@ func main() {
 		slog.Warn("no detectors enabled, nodux will poll but never report anything")
 	}
 
+	actions := []action.Action{action.NewConsole()}
+	var webhook *action.WebhookAction
+	if wh := cfg.Actions.Webhook; wh.Enabled {
+		webhook = action.NewWebhook(action.WebhookConfig{
+			URL:     wh.URL,
+			Format:  wh.Format,
+			Headers: wh.Headers,
+			Timeout: wh.Timeout(),
+		})
+		actions = append(actions, webhook)
+	}
+
 	eng := engine.New(docker, engine.Options{
 		Detectors:         detectors,
 		EventDetectors:    eventDetectors,
-		Actions:           []action.Action{action.NewConsole()},
+		Actions:           actions,
 		Classifier:        llm.NewNoopClassifier(),
 		PollInterval:      cfg.PollInterval(),
 		AlertCooldown:     cfg.AlertCooldown(),
 		ExcludeContainers: cfg.ExcludeContainers,
+		CollectStats:      cfg.Detectors.Memory.Enabled,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -75,9 +95,19 @@ func main() {
 		"poll_interval", cfg.PollInterval().String(),
 		"alert_cooldown", cfg.AlertCooldown().String(),
 		"detectors", enabledNames(detectors, eventDetectors),
+		"webhook", cfg.Actions.Webhook.Enabled,
 	)
 
 	eng.Run(ctx)
+
+	if webhook != nil {
+		// Give queued alerts a chance to go out before exiting.
+		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := webhook.Close(closeCtx); err != nil {
+			slog.Error("webhook shutdown", "error", err)
+		}
+		cancel()
+	}
 
 	slog.Info("nodux stopped")
 }

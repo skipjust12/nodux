@@ -23,6 +23,8 @@ type Server struct {
 	containers map[string]*dockerclient.ContainerInspect
 	order      []string
 	logs       map[string][]string
+	stats      map[string]*dockerclient.Stats
+	statsCalls map[string]int
 	// Each /events connection gets the next channel from streams; the
 	// stream ends when that channel is closed.
 	streams      chan chan dockerclient.Event
@@ -42,6 +44,8 @@ func New(t *testing.T) *Server {
 		SocketPath:   filepath.Join(dir, "docker.sock"),
 		containers:   make(map[string]*dockerclient.ContainerInspect),
 		logs:         make(map[string][]string),
+		stats:        make(map[string]*dockerclient.Stats),
+		statsCalls:   make(map[string]int),
 		streams:      make(chan chan dockerclient.Event, 16),
 		EventQueries: make(chan string, 16),
 	}
@@ -64,6 +68,20 @@ func (s *Server) AddContainer(c *dockerclient.ContainerInspect, logs ...string) 
 	}
 	s.containers[c.ID] = c
 	s.logs[c.ID] = logs
+}
+
+// SetStats sets what /containers/{id}/stats returns.
+func (s *Server) SetStats(id string, st *dockerclient.Stats) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stats[id] = st
+}
+
+// StatsCallCount returns how many times stats were fetched for id.
+func (s *Server) StatsCallCount(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statsCalls[id]
 }
 
 func (s *Server) RemoveContainer(id string) {
@@ -96,6 +114,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.events(w, r)
 	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/json"):
 		s.inspect(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/json"))
+	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/stats"):
+		s.containerStats(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/stats"))
 	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/logs"):
 		s.containerLogs(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/logs"))
 	default:
@@ -123,6 +143,18 @@ func (s *Server) inspect(w http.ResponseWriter, id string) {
 		return
 	}
 	json.NewEncoder(w).Encode(c)
+}
+
+func (s *Server) containerStats(w http.ResponseWriter, id string) {
+	s.mu.Lock()
+	s.statsCalls[id]++
+	st, ok := s.stats[id]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, `{"message":"No such container"}`, http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(st)
 }
 
 // containerLogs writes the multiplexed (non-TTY) log format.

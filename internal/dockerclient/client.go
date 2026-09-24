@@ -131,6 +131,23 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerIns
 	return &out, nil
 }
 
+// ContainerStats returns a single stats sample. one-shot skips the
+// daemon's wait for a second sample (only needed for CPU percentages),
+// which makes this a ~30ms call instead of ~1-2s.
+func (c *Client) ContainerStats(ctx context.Context, id string) (*Stats, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+id+"/stats?stream=false&one-shot=true")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var out Stats
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode container stats %s: %w", id, err)
+	}
+	return &out, nil
+}
+
 // ContainerLogs returns up to tail of the last non-empty log lines
 // (stdout+stderr interleaved, in the order the daemon emits them).
 func (c *Client) ContainerLogs(ctx context.Context, id string, tail int, tty bool) ([]string, error) {

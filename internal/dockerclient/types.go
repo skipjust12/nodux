@@ -16,6 +16,9 @@ type ContainerInspect struct {
 	Config struct {
 		Tty bool `json:"Tty"`
 	} `json:"Config"`
+	HostConfig struct {
+		Memory int64 `json:"Memory"` // memory limit in bytes, 0 = unlimited
+	} `json:"HostConfig"`
 	State struct {
 		Status     string  `json:"Status"`
 		Running    bool    `json:"Running"`
@@ -52,4 +55,29 @@ type Event struct {
 type Actor struct {
 	ID         string            `json:"ID"`
 	Attributes map[string]string `json:"Attributes"`
+}
+
+// Stats is the GET /containers/{id}/stats response (memory part only).
+type Stats struct {
+	MemoryStats struct {
+		Usage uint64            `json:"usage"`
+		Limit uint64            `json:"limit"`
+		Stats map[string]uint64 `json:"stats"`
+	} `json:"memory_stats"`
+}
+
+// MemoryUsed is the container's working set, computed the same way as
+// docker stats: usage minus inactive page cache, which the kernel can
+// reclaim before it ever OOM-kills anything. The key is
+// total_inactive_file on cgroup v1 and inactive_file on cgroup v2.
+func (s *Stats) MemoryUsed() uint64 {
+	m := s.MemoryStats
+	inactive, ok := m.Stats["total_inactive_file"]
+	if !ok {
+		inactive = m.Stats["inactive_file"]
+	}
+	if inactive > m.Usage {
+		return 0
+	}
+	return m.Usage - inactive
 }
