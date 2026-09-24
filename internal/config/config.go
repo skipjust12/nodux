@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -18,6 +19,7 @@ type Config struct {
 	Docker               DockerConfig    `yaml:"docker"`
 	ExcludeContainers    []string        `yaml:"exclude_containers"`
 	Detectors            DetectorsConfig `yaml:"detectors"`
+	Actions              ActionsConfig   `yaml:"actions"`
 	LLM                  LLMConfig       `yaml:"llm"`
 }
 
@@ -30,6 +32,29 @@ type DetectorsConfig struct {
 	OOM       ToggleConfig    `yaml:"oom"`
 	Unhealthy ToggleConfig    `yaml:"unhealthy"`
 	Exit      ExitConfig      `yaml:"exit"`
+	Memory    MemoryConfig    `yaml:"memory"`
+}
+
+type MemoryConfig struct {
+	Enabled          bool    `yaml:"enabled"`
+	ThresholdPercent float64 `yaml:"threshold_percent"`
+	// ForSeconds is how long usage must stay above the threshold. nil
+	// means the default (60); 0 alerts on the first sample.
+	ForSeconds *int `yaml:"for_seconds"`
+}
+
+type ActionsConfig struct {
+	Webhook WebhookConfig `yaml:"webhook"`
+}
+
+type WebhookConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	URL     string `yaml:"url"`
+	Format  string `yaml:"format"` // json (default) or slack
+	// Values may reference environment variables ($VAR / ${VAR}), so
+	// tokens don't have to live in the config file.
+	Headers        map[string]string `yaml:"headers"`
+	TimeoutSeconds int               `yaml:"timeout_seconds"`
 }
 
 // ToggleConfig is for detectors that have nothing to tune.
@@ -62,6 +87,14 @@ func (c *Config) PollInterval() time.Duration {
 
 func (c *Config) AlertCooldown() time.Duration {
 	return time.Duration(*c.AlertCooldownMinutes) * time.Minute
+}
+
+func (c *MemoryConfig) For() time.Duration {
+	return time.Duration(*c.ForSeconds) * time.Second
+}
+
+func (c *WebhookConfig) Timeout() time.Duration {
+	return time.Duration(c.TimeoutSeconds) * time.Second
 }
 
 func (c *CrashLoopConfig) Window() time.Duration {
@@ -104,6 +137,25 @@ func applyDefaults(cfg *Config) {
 	if cfg.Detectors.Exit.IgnoreExitCodes == nil {
 		cfg.Detectors.Exit.IgnoreExitCodes = []int{0}
 	}
+	if cfg.Detectors.Memory.ThresholdPercent == 0 {
+		cfg.Detectors.Memory.ThresholdPercent = 90
+	}
+	if cfg.Detectors.Memory.ForSeconds == nil {
+		def := 60
+		cfg.Detectors.Memory.ForSeconds = &def
+	}
+
+	wh := &cfg.Actions.Webhook
+	wh.URL = os.ExpandEnv(wh.URL)
+	for k, v := range wh.Headers {
+		wh.Headers[k] = os.ExpandEnv(v)
+	}
+	if wh.Format == "" {
+		wh.Format = "json"
+	}
+	if wh.TimeoutSeconds <= 0 {
+		wh.TimeoutSeconds = 5
+	}
 	if cfg.Detectors.CrashLoop.RestartThreshold <= 0 {
 		cfg.Detectors.CrashLoop.RestartThreshold = 3
 	}
@@ -128,6 +180,23 @@ func (c *Config) validate() error {
 		}
 		if c.Detectors.CrashLoop.WindowMinutes <= 0 {
 			return fmt.Errorf("detectors.crashloop.window_minutes must be positive")
+		}
+	}
+	if m := c.Detectors.Memory; m.Enabled {
+		if m.ThresholdPercent <= 0 || m.ThresholdPercent > 100 {
+			return fmt.Errorf("detectors.memory.threshold_percent must be in (0, 100]")
+		}
+		if *m.ForSeconds < 0 {
+			return fmt.Errorf("detectors.memory.for_seconds must not be negative")
+		}
+	}
+	if wh := c.Actions.Webhook; wh.Enabled {
+		u, err := url.Parse(wh.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("actions.webhook.url must be an http(s) URL, got %q", wh.URL)
+		}
+		if wh.Format != "json" && wh.Format != "slack" {
+			return fmt.Errorf("actions.webhook.format must be json or slack, got %q", wh.Format)
 		}
 	}
 	return nil

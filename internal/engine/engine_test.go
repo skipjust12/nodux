@@ -110,6 +110,55 @@ func TestEngine_PollDetectorWithLogsAndExclude(t *testing.T) {
 	rec.none(t, 150*time.Millisecond) // excluded container and no repeats
 }
 
+func TestEngine_MemoryStatsOnlyForLimitedRunningContainers(t *testing.T) {
+	srv := dockertest.New(t)
+
+	limited := container("m1", "cache", "running")
+	limited.HostConfig.Memory = 256 << 20
+	srv.AddContainer(limited)
+	st := &dockerclient.Stats{}
+	st.MemoryStats.Usage = 250 << 20
+	st.MemoryStats.Limit = 256 << 20
+	st.MemoryStats.Stats = map[string]uint64{"total_inactive_file": 5 << 20}
+	srv.SetStats("m1", st)
+
+	srv.AddContainer(container("u1", "unlimited", "running"))
+	stopped := container("s1", "stopped", "exited")
+	stopped.HostConfig.Memory = 256 << 20
+	srv.AddContainer(stopped)
+
+	rec := start(t, srv, Options{
+		Detectors:    []detector.Detector{detector.NewMemoryDetector(90, 0)},
+		CollectStats: true,
+	})
+
+	issue := rec.next(t)
+	if issue.Detector != "memory" || issue.Container.Name != "cache" {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	if issue.Container.MemoryUsed != 245<<20 || !strings.Contains(issue.Message, "96% of limit") {
+		t.Errorf("usage not computed from stats: used=%d msg=%q", issue.Container.MemoryUsed, issue.Message)
+	}
+	rec.none(t, 100*time.Millisecond)
+
+	if srv.StatsCallCount("u1") != 0 || srv.StatsCallCount("s1") != 0 {
+		t.Errorf("stats fetched for unlimited/stopped containers: u1=%d s1=%d", srv.StatsCallCount("u1"), srv.StatsCallCount("s1"))
+	}
+}
+
+func TestEngine_NoStatsWhenNotRequested(t *testing.T) {
+	srv := dockertest.New(t)
+	limited := container("m1", "cache", "running")
+	limited.HostConfig.Memory = 256 << 20
+	srv.AddContainer(limited)
+
+	start(t, srv, Options{Detectors: []detector.Detector{detector.NewUnhealthyDetector()}})
+	time.Sleep(100 * time.Millisecond)
+	if n := srv.StatsCallCount("m1"); n != 0 {
+		t.Fatalf("stats fetched %d times with CollectStats off", n)
+	}
+}
+
 func TestEngine_EventDetectorsAndCooldown(t *testing.T) {
 	srv := dockertest.New(t)
 	srv.AddContainer(container("w1", "worker", "exited"), "panic: nil map")

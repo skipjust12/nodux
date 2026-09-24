@@ -39,6 +39,30 @@ detectors:
     enabled: true
     ignore_exit_codes: [0]
 
+  # Polled: memory usage (minus reclaimable page cache, same as
+  # docker stats) stays at or above threshold_percent of the container's
+  # memory limit for for_seconds. The early warning before "oom".
+  # Only containers started with a memory limit (-m / mem_limit) are
+  # checked; adds one stats API call per such container per poll.
+  memory:
+    enabled: true
+    threshold_percent: 90
+    for_seconds: 60
+
+# Where alerts go. Console (JSON lines on stdout) is always on.
+actions:
+  webhook:
+    enabled: false
+    # $VAR / ${VAR} are expanded from the environment, in url and headers.
+    url: https://hooks.slack.com/services/${NODUX_SLACK_PATH}
+    # json: POST the full alert record (same as the console line).
+    # slack: POST {"text": ...}; also works for Mattermost, Rocket.Chat,
+    # and Discord (append /slack to the Discord webhook URL).
+    format: slack
+    timeout_seconds: 5
+    headers: {}
+      # Authorization: Bearer ${NODUX_WEBHOOK_TOKEN}
+
 # Stub for the optional future LLM layer (does nothing yet).
 llm:
   enabled: false

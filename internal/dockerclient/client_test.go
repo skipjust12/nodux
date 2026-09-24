@@ -102,3 +102,30 @@ func TestClient_EventsStopsOnCancel(t *testing.T) {
 		t.Fatal("Events didn't return after cancel")
 	}
 }
+
+func TestClient_Stats(t *testing.T) {
+	srv := dockertest.New(t)
+	for name, tc := range map[string]struct {
+		stats map[string]uint64
+		want  uint64
+	}{
+		"cgroup v1":              {map[string]uint64{"total_inactive_file": 100, "inactive_file": 999}, 900},
+		"cgroup v2":              {map[string]uint64{"inactive_file": 300}, 700},
+		"no stats":               {nil, 1000},
+		"inactive exceeds usage": {map[string]uint64{"inactive_file": 5000}, 0},
+	} {
+		st := &dockerclient.Stats{}
+		st.MemoryStats.Usage = 1000
+		st.MemoryStats.Limit = 4096
+		st.MemoryStats.Stats = tc.stats
+		srv.SetStats("abc", st)
+
+		got, err := dockerclient.New(srv.SocketPath).ContainerStats(context.Background(), "abc")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.MemoryUsed() != tc.want || got.MemoryStats.Limit != 4096 {
+			t.Errorf("%s: used = %d, want %d (limit %d)", name, got.MemoryUsed(), tc.want, got.MemoryStats.Limit)
+		}
+	}
+}

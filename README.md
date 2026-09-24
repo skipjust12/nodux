@@ -14,6 +14,7 @@ for triaging ambiguous hits is stubbed out for later.
 | `unhealthy` | poll   | warning  | the container's `HEALTHCHECK` reports `unhealthy` (once per episode; includes the last check's output) |
 | `oom`       | events | critical | the kernel OOM killer hit the container's memory limit |
 | `exit`      | events | warning  | the main process exited with a non-zero code on its own (crash, segfault, external `kill -9`) |
+| `memory`    | poll   | warning  | memory usage stays ≥ `threshold_percent` of the container's limit for `for_seconds` — the early warning before `oom` |
 
 Why two sources: some failures are gone by the next poll. With a
 restart policy, Docker clears `State.OOMKilled` on the very next start,
@@ -22,6 +23,12 @@ polling — it's only reliable as an `oom` event. The same stream tells
 crashes apart from intentional stops: `docker stop` / `kill` /
 `restart` / `rm -f` / `compose down` all emit `kill` events before
 `die`, a crash is a bare `die`, so `exit` never fires on manual stops.
+
+`memory` measures usage the way `docker stats` does (minus reclaimable
+page cache), only for containers started with a memory limit — without
+one, the "limit" is the host's RAM, which is a different check. It
+re-arms only after usage drops 5 points below the threshold, so a
+container hovering at the line doesn't flap.
 
 Every alert goes through a cooldown (`alert_cooldown_minutes`, default
 10): the same detector won't re-alert on the same container name within
@@ -35,8 +42,14 @@ that window, so a crash-looping container gives you one `exit` and one
   and Podman.
 - `internal/detector` — the `Detector` (poll snapshots) and
   `EventDetector` (event stream) interfaces and the detectors above.
-- `internal/action` — the `Action` interface + `ConsoleAction` (prints
-  each detected problem as a JSON line to stdout).
+- `internal/action` — the `Action` interface and the alert `Record`
+  schema. `ConsoleAction` prints each alert as a JSON line to stdout
+  (always on); `WebhookAction` POSTs it to a URL, either as the same
+  JSON record or Slack-style `{"text": ...}` (Slack, Mattermost,
+  Rocket.Chat, Discord's `/slack` endpoint). Webhook delivery runs on a
+  background queue, so a dead endpoint never stalls detection; it
+  retries network errors, 5xx and 429 (3 attempts), not other 4xx, and
+  drains pending alerts on shutdown.
 - `internal/llm` — a `Classifier`/`NoopClassifier` stub, the extension
   point for a future optional LLM layer that classifies ambiguous
   detector hits. Currently a no-op.
@@ -55,7 +68,9 @@ that window, so a crash-looping container gives you one `exit` and one
 
 ```sh
 cp config.example.yaml config.yaml
-# adjust socket_path for Docker Desktop/Podman if needed
+# adjust socket_path for Docker Desktop/Podman if needed;
+# to get alerts in Slack, set actions.webhook.enabled: true and
+#   export NODUX_SLACK_PATH=T000/B000/XXXX
 
 go run ./cmd/nodux --config config.yaml
 ```
@@ -81,6 +96,10 @@ docker run -d --name crasher --restart=always busybox sh -c 'echo boom; exit 1'
 docker run -d --name hog --restart=always -m 16m --memory-swap 16m \
   busybox sh -c 'sleep 2; x=a; while true; do x="$x$x"; done'
 
+# memory (after for_seconds)
+docker run -d --name fat -m 64m --memory-swap 64m \
+  busybox sh -c 'dd if=/dev/zero of=/dev/shm/f bs=1M count=58; sleep 1000'
+
 # unhealthy
 docker run -d --name sick --health-cmd 'echo 503; false' \
   --health-interval 2s --health-retries 2 busybox sleep 1000
@@ -98,7 +117,7 @@ Example alert:
 Clean up:
 
 ```sh
-docker rm -f crasher hog sick calm
+docker rm -f crasher hog fat sick calm
 ```
 
 Podman: the event and exit-code handling follows Docker's API; the

@@ -31,6 +31,11 @@ type ContainerSnapshot struct {
 	HealthStatus        string // starting, healthy, unhealthy
 	HealthFailingStreak int
 	HealthLastOutput    string
+
+	// Memory is only filled in for running containers with a memory
+	// limit, and only when a detector needs it. Limit 0 = not collected.
+	MemoryUsed  uint64
+	MemoryLimit uint64
 }
 
 // ContainerEvent is a container lifecycle event from the daemon.

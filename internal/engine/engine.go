@@ -34,6 +34,10 @@ type Options struct {
 	// the same container name. Zero disables it.
 	AlertCooldown     time.Duration
 	ExcludeContainers []string
+	// CollectStats fetches memory stats for running containers that
+	// have a memory limit (one extra API call each per poll). Only
+	// needed by the memory detector.
+	CollectStats bool
 }
 
 type Engine struct {
@@ -45,6 +49,7 @@ type Engine struct {
 	pollInterval      time.Duration
 	cooldown          time.Duration
 	excludeContainers map[string]struct{}
+	collectStats      bool
 
 	// Only touched by the poll loop.
 	lastSeen map[string]struct{}
@@ -74,6 +79,7 @@ func New(docker *dockerclient.Client, opts Options) *Engine {
 		pollInterval:      opts.PollInterval,
 		cooldown:          opts.AlertCooldown,
 		excludeContainers: exclude,
+		collectStats:      opts.CollectStats,
 		lastSeen:          make(map[string]struct{}),
 		lastAlert:         make(map[string]time.Time),
 		now:               time.Now,
@@ -200,6 +206,15 @@ func (e *Engine) pollOnce(ctx context.Context) error {
 		}
 
 		snapshot := toSnapshot(name, inspect)
+		if e.collectStats && inspect.State.Running && inspect.HostConfig.Memory > 0 {
+			if stats, err := e.docker.ContainerStats(ctx, summary.ID); err != nil {
+				logContainerErr("fetch stats failed", name, err)
+			} else {
+				snapshot.MemoryUsed = stats.MemoryUsed()
+				snapshot.MemoryLimit = stats.MemoryStats.Limit
+			}
+		}
+
 		var issues []*detector.Issue
 		for _, d := range e.detectors {
 			if issue := d.Check(snapshot); issue != nil {
