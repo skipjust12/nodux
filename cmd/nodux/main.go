@@ -38,14 +38,34 @@ func main() {
 			cfg.Detectors.CrashLoop.Window(),
 		))
 	}
-	if len(detectors) == 0 {
+	if cfg.Detectors.Unhealthy.Enabled {
+		detectors = append(detectors, detector.NewUnhealthyDetector())
+	}
+
+	var eventDetectors []detector.EventDetector
+	if cfg.Detectors.OOM.Enabled {
+		eventDetectors = append(eventDetectors, detector.NewOOMDetector())
+	}
+	if cfg.Detectors.Exit.Enabled {
+		eventDetectors = append(eventDetectors, detector.NewExitDetector(
+			cfg.Detectors.Exit.IgnoreExitCodes,
+			cfg.Detectors.OOM.Enabled,
+		))
+	}
+
+	if len(detectors) == 0 && len(eventDetectors) == 0 {
 		slog.Warn("no detectors enabled, nodux will poll but never report anything")
 	}
 
-	actions := []action.Action{action.NewConsole()}
-	classifier := llm.NewNoopClassifier()
-
-	eng := engine.New(docker, detectors, actions, classifier, cfg.PollInterval(), cfg.ExcludeContainers)
+	eng := engine.New(docker, engine.Options{
+		Detectors:         detectors,
+		EventDetectors:    eventDetectors,
+		Actions:           []action.Action{action.NewConsole()},
+		Classifier:        llm.NewNoopClassifier(),
+		PollInterval:      cfg.PollInterval(),
+		AlertCooldown:     cfg.AlertCooldown(),
+		ExcludeContainers: cfg.ExcludeContainers,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -53,10 +73,22 @@ func main() {
 	slog.Info("nodux starting",
 		"socket", cfg.Docker.SocketPath,
 		"poll_interval", cfg.PollInterval().String(),
-		"crashloop_enabled", cfg.Detectors.CrashLoop.Enabled,
+		"alert_cooldown", cfg.AlertCooldown().String(),
+		"detectors", enabledNames(detectors, eventDetectors),
 	)
 
 	eng.Run(ctx)
 
 	slog.Info("nodux stopped")
+}
+
+func enabledNames(detectors []detector.Detector, eventDetectors []detector.EventDetector) []string {
+	var names []string
+	for _, d := range detectors {
+		names = append(names, d.Name())
+	}
+	for _, d := range eventDetectors {
+		names = append(names, d.Name())
+	}
+	return names
 }

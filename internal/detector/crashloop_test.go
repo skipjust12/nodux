@@ -75,3 +75,12 @@ func TestCrashLoopDetector_IgnoresHealthyContainer(t *testing.T) {
 		}
 	}
 }
+
+func TestCrashLoopDetector_Forget(t *testing.T) {
+	d := NewCrashLoopDetector(3, 5*time.Minute)
+	d.Check(ContainerSnapshot{ID: "c1", RestartCount: 0})
+	d.Forget("c1")
+	if len(d.state) != 0 {
+		t.Fatalf("state not dropped: %v", d.state)
+	}
+}

@@ -10,11 +10,15 @@ import (
 
 // Config describes the contents of config.yaml.
 type Config struct {
-	PollIntervalSeconds int             `yaml:"poll_interval_seconds"`
-	Docker              DockerConfig    `yaml:"docker"`
-	ExcludeContainers   []string        `yaml:"exclude_containers"`
-	Detectors           DetectorsConfig `yaml:"detectors"`
-	LLM                 LLMConfig       `yaml:"llm"`
+	PollIntervalSeconds int `yaml:"poll_interval_seconds"`
+	// AlertCooldownMinutes suppresses repeat alerts from the same
+	// detector for the same container name. nil means "use the default";
+	// 0 disables the cooldown.
+	AlertCooldownMinutes *int            `yaml:"alert_cooldown_minutes"`
+	Docker               DockerConfig    `yaml:"docker"`
+	ExcludeContainers    []string        `yaml:"exclude_containers"`
+	Detectors            DetectorsConfig `yaml:"detectors"`
+	LLM                  LLMConfig       `yaml:"llm"`
 }
 
 type DockerConfig struct {
@@ -23,6 +27,20 @@ type DockerConfig struct {
 
 type DetectorsConfig struct {
 	CrashLoop CrashLoopConfig `yaml:"crashloop"`
+	OOM       ToggleConfig    `yaml:"oom"`
+	Unhealthy ToggleConfig    `yaml:"unhealthy"`
+	Exit      ExitConfig      `yaml:"exit"`
+}
+
+// ToggleConfig is for detectors that have nothing to tune.
+type ToggleConfig struct {
+	Enabled bool `yaml:"enabled"`
+}
+
+type ExitConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Exit codes that are never reported. nil means the default ([0]).
+	IgnoreExitCodes []int `yaml:"ignore_exit_codes"`
 }
 
 type CrashLoopConfig struct {
@@ -40,6 +58,10 @@ type LLMConfig struct {
 
 func (c *Config) PollInterval() time.Duration {
 	return time.Duration(c.PollIntervalSeconds) * time.Second
+}
+
+func (c *Config) AlertCooldown() time.Duration {
+	return time.Duration(*c.AlertCooldownMinutes) * time.Minute
 }
 
 func (c *CrashLoopConfig) Window() time.Duration {
@@ -72,8 +94,15 @@ func applyDefaults(cfg *Config) {
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 15
 	}
+	if cfg.AlertCooldownMinutes == nil {
+		def := 10
+		cfg.AlertCooldownMinutes = &def
+	}
 	if cfg.Docker.SocketPath == "" {
 		cfg.Docker.SocketPath = "/var/run/docker.sock"
+	}
+	if cfg.Detectors.Exit.IgnoreExitCodes == nil {
+		cfg.Detectors.Exit.IgnoreExitCodes = []int{0}
 	}
 	if cfg.Detectors.CrashLoop.RestartThreshold <= 0 {
 		cfg.Detectors.CrashLoop.RestartThreshold = 3
@@ -86,6 +115,9 @@ func applyDefaults(cfg *Config) {
 func (c *Config) validate() error {
 	if c.PollIntervalSeconds <= 0 {
 		return fmt.Errorf("poll_interval_seconds must be positive")
+	}
+	if *c.AlertCooldownMinutes < 0 {
+		return fmt.Errorf("alert_cooldown_minutes must not be negative")
 	}
 	if c.Docker.SocketPath == "" {
 		return fmt.Errorf("docker.socket_path must not be empty")

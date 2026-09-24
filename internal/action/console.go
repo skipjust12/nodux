@@ -24,8 +24,11 @@ type consoleRecord struct {
 	Message       string   `json:"message"`
 	ContainerID   string   `json:"container_id"`
 	ContainerName string   `json:"container_name"`
+	Status        string   `json:"status,omitempty"`
 	RestartCount  int      `json:"restart_count"`
 	LastExitCode  int      `json:"last_exit_code"`
+	OOMKilled     bool     `json:"oom_killed,omitempty"`
+	HealthStatus  string   `json:"health_status,omitempty"`
 	Logs          []string `json:"logs"`
 }
 
@@ -37,8 +40,11 @@ func (a *ConsoleAction) Run(_ context.Context, issue detector.Issue) error {
 		Message:       issue.Message,
 		ContainerID:   issue.Container.ID,
 		ContainerName: issue.Container.Name,
+		Status:        issue.Container.Status,
 		RestartCount:  issue.Container.RestartCount,
 		LastExitCode:  issue.Container.ExitCode,
+		OOMKilled:     issue.Container.OOMKilled,
+		HealthStatus:  issue.Container.HealthStatus,
 		Logs:          issue.Logs,
 	}
 
