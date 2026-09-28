@@ -9,6 +9,12 @@ func ev(id, action string, code int) ContainerEvent {
 	return ContainerEvent{ID: id, Name: "app", Action: action, ExitCode: code}
 }
 
+func sig(id string, signal, stopSignal int) ContainerEvent {
+	e := ev(id, "kill", 0)
+	e.Signal, e.StopSignal = signal, stopSignal
+	return e
+}
+
 func TestOOMDetector(t *testing.T) {
 	d := NewOOMDetector()
 	for _, action := range []string{"start", "kill", "die", "destroy"} {
@@ -78,6 +84,23 @@ func TestExitDetector(t *testing.T) {
 			want:   "segmentation fault",
 		},
 		{
+			name: "reload signal doesn't mask a later crash",
+			events: []ContainerEvent{
+				ev("c1", "start", 0), sig("c1", 1, 0), sig("c1", 10, 0), ev("c1", "die", 1),
+			},
+			want: "code 1",
+		},
+		{
+			name: "custom stop signal counts as a stop",
+			events: []ContainerEvent{
+				ev("c1", "start", 0), sig("c1", 28, 28), ev("c1", "die", 1),
+			},
+		},
+		{
+			name:   "docker kill -s INT is a stop",
+			events: []ContainerEvent{ev("c1", "start", 0), sig("c1", 2, 15), ev("c1", "die", 130)},
+		},
+		{
 			name:   "kill on another container doesn't mask this one",
 			events: []ContainerEvent{ev("c2", "kill", 0), ev("c1", "die", 2)},
 			want:   "code 2",
@@ -112,8 +135,8 @@ func TestExitDetector_DestroyDropsState(t *testing.T) {
 	d := NewExitDetector([]int{0}, true)
 	d.HandleEvent(ev("c1", "kill", 0))
 	d.HandleEvent(ev("c1", "destroy", 0))
-	if len(d.killed) != 0 || len(d.oomed) != 0 {
-		t.Fatalf("state not dropped: killed=%v oomed=%v", d.killed, d.oomed)
+	if len(d.stops) != 0 || len(d.oomed) != 0 {
+		t.Fatalf("state not dropped: stops=%v oomed=%v", d.stops, d.oomed)
 	}
 }
 
@@ -121,5 +144,16 @@ func TestExitDetector_CustomIgnoreCodes(t *testing.T) {
 	d := NewExitDetector([]int{0, 143}, true)
 	if issue := d.HandleEvent(ev("c1", "die", 143)); issue != nil {
 		t.Fatalf("ignored code reported: %+v", issue)
+	}
+}
+
+func TestParseSignal(t *testing.T) {
+	for in, want := range map[string]int{
+		"15": 15, "SIGTERM": 15, "term": 15, "SIGWINCH": 28, "QUIT": 3,
+		"SIGRTMIN+3": 37, "RTMIN": 34, "": 0, "SIGBOGUS": 0, "-1": 0,
+	} {
+		if got := ParseSignal(in); got != want {
+			t.Errorf("ParseSignal(%q) = %d, want %d", in, got, want)
+		}
 	}
 }

@@ -20,6 +20,7 @@ type Server struct {
 	SocketPath string
 
 	mu         sync.Mutex
+	down       bool
 	containers map[string]*dockerclient.ContainerInspect
 	order      []string
 	logs       map[string][]string
@@ -103,7 +104,22 @@ func (s *Server) NewStream() chan<- dockerclient.Event {
 	return ch
 }
 
+// SetDown makes every endpoint fail with 500, like a daemon that's
+// wedged or restarting.
+func (s *Server) SetDown(down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.down = down
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	down := s.down
+	s.mu.Unlock()
+	if down {
+		http.Error(w, `{"message":"daemon unavailable"}`, http.StatusInternalServerError)
+		return
+	}
 	path := r.URL.Path
 	switch {
 	case path == "/_ping":

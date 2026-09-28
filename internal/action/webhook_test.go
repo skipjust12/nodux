@@ -96,7 +96,7 @@ func TestWebhook_SlackFormat(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := msg["text"]
-	if !strings.HasPrefix(text, "*[CRITICAL] oom* on `api`: container was killed") {
+	if !strings.HasPrefix(text, "*[CRITICAL] oom* `api`: container was killed") {
 		t.Errorf("text = %q", text)
 	}
 	if !strings.Contains(text, "l3\nl4\nl5\nl6\nl7") || strings.Contains(text, "l2") {
@@ -189,5 +189,75 @@ func TestWebhook_RunNeverBlocksAndCloseAbandonsHungEndpoint(t *testing.T) {
 	}
 	if err := w.Run(context.Background(), testIssue()); err == nil {
 		t.Fatal("Run after Close should fail")
+	}
+}
+
+func TestWebhook_ErrorsDontLeakURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL + "/services/T0/B0/SECRETTOKEN"
+	srv.Close() // connection refused from here on
+
+	w := newWebhook(t, WebhookConfig{URL: url})
+	_, err := w.post([]byte("{}"))
+	if err == nil {
+		t.Fatal("expected a connection error")
+	}
+	if strings.Contains(err.Error(), "SECRETTOKEN") {
+		t.Fatalf("error leaks the webhook URL: %v", err)
+	}
+}
+
+func TestSlackText_ResolvedHostAndAnalysis(t *testing.T) {
+	issue := testIssue()
+	issue.Host = "vps1"
+	issue.Analysis = "Heap grows without bound.\nCheck the cache size."
+	text := slackText(issue)
+	if !strings.HasPrefix(text, "*[CRITICAL] oom* `api` on vps1: ") {
+		t.Errorf("text = %q", text)
+	}
+	if !strings.Contains(text, "\n> Heap grows without bound.\n> Check the cache size.") {
+		t.Errorf("analysis not quoted: %q", text)
+	}
+
+	resolved := detector.Issue{Detector: "host_disk", Severity: detector.SeverityCritical, Resource: "/", Message: "resolved after 5m0s (was: disk / at 95%)", Resolved: true}
+	if got := slackText(resolved); got != "*[RESOLVED] host_disk* `/`: resolved after 5m0s (was: disk / at 95%)" {
+		t.Errorf("resolved text = %q", got)
+	}
+}
+
+func TestSlackText_FitsDiscordAndEscapesFences(t *testing.T) {
+	issue := testIssue()
+	issue.Message = strings.Repeat("m", 1100)
+	issue.Logs = []string{
+		strings.Repeat("a", 5000), strings.Repeat("b", 400), strings.Repeat("c", 400),
+		"```rm -rf```", strings.Repeat("d", 400),
+	}
+	text := slackText(issue)
+	if len(text) > slackMaxMessage {
+		t.Fatalf("text is %d bytes, over %d", len(text), slackMaxMessage)
+	}
+	if strings.Contains(text, "aaaa") {
+		t.Error("oldest lines should be dropped first")
+	}
+	if strings.Count(text, "```") != 2 {
+		t.Errorf("a log line broke out of the code block: %q", text)
+	}
+}
+
+func TestRecord_HostLevelOmitsContainerFields(t *testing.T) {
+	b, _ := json.Marshal(NewRecord(detector.Issue{Detector: "host_disk", Severity: "critical", Message: "m", Resource: "/", Host: "vps1"}))
+	s := string(b)
+	for _, field := range []string{"container_id", "restart_count", "last_exit_code", "logs"} {
+		if strings.Contains(s, field) {
+			t.Errorf("host record has %s: %s", field, s)
+		}
+	}
+	if !strings.Contains(s, `"state":"firing"`) || !strings.Contains(s, `"resource":"/"`) || !strings.Contains(s, `"host":"vps1"`) {
+		t.Errorf("record = %s", s)
+	}
+
+	b, _ = json.Marshal(NewRecord(detector.Issue{Detector: "exit", Container: detector.ContainerSnapshot{ID: "c1"}, Resolved: true}))
+	if s := string(b); !strings.Contains(s, `"restart_count":0`) || !strings.Contains(s, `"last_exit_code":0`) || !strings.Contains(s, `"state":"resolved"`) {
+		t.Errorf("container record = %s", s)
 	}
 }

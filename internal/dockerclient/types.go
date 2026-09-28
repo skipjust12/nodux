@@ -2,10 +2,9 @@ package dockerclient
 
 // ContainerSummary is one entry of the GET /containers/json response.
 type ContainerSummary struct {
-	ID     string   `json:"Id"`
-	Names  []string `json:"Names"`
-	State  string   `json:"State"`
-	Status string   `json:"Status"`
+	ID    string   `json:"Id"`
+	Names []string `json:"Names"`
+	State string   `json:"State"` // running, exited, restarting, ...
 }
 
 // ContainerInspect is the GET /containers/{id}/json response (only the
@@ -14,7 +13,8 @@ type ContainerInspect struct {
 	ID     string `json:"Id"`
 	Name   string `json:"Name"`
 	Config struct {
-		Tty bool `json:"Tty"`
+		Tty        bool   `json:"Tty"`
+		StopSignal string `json:"StopSignal"` // e.g. "SIGQUIT"; empty = SIGTERM
 	} `json:"Config"`
 	HostConfig struct {
 		Memory int64 `json:"Memory"` // memory limit in bytes, 0 = unlimited
@@ -22,7 +22,6 @@ type ContainerInspect struct {
 	State struct {
 		Status     string  `json:"Status"`
 		Running    bool    `json:"Running"`
-		Restarting bool    `json:"Restarting"`
 		OOMKilled  bool    `json:"OOMKilled"`
 		ExitCode   int     `json:"ExitCode"`
 		StartedAt  string  `json:"StartedAt"`

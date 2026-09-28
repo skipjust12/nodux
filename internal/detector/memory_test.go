@@ -9,7 +9,7 @@ import (
 const mib = 1024 * 1024
 
 func memSnap(usedMiB uint64) ContainerSnapshot {
-	return ContainerSnapshot{ID: "c1", Name: "api", MemoryUsed: usedMiB * mib, MemoryLimit: 100 * mib}
+	return ContainerSnapshot{ID: "c1", Name: "api", Status: "running", MemoryUsed: usedMiB * mib, MemoryLimit: 100 * mib}
 }
 
 func TestMemoryDetector_SustainAndHysteresis(t *testing.T) {
@@ -43,20 +43,18 @@ func TestMemoryDetector_SustainAndHysteresis(t *testing.T) {
 	if !strings.Contains(issue.Message, "96% of limit (96.0MiB / 100.0MiB)") {
 		t.Errorf("message = %q", issue.Message)
 	}
-	if step(97, time.Minute) != nil {
-		t.Fatal("repeat alert while still above threshold")
-	}
 
-	// Dropping into the hysteresis band (85-90%) doesn't re-arm...
-	step(87, time.Minute)
-	if step(95, 2*time.Minute) != nil || step(95, 2*time.Minute) != nil {
-		t.Fatal("re-alerted without dropping below the re-arm level")
+	// The episode lasts through the hysteresis band (85-90%)...
+	if step(87, time.Minute) == nil {
+		t.Fatal("episode ended inside the hysteresis band")
 	}
-	// ...dropping below 85% does.
-	step(70, time.Minute)
+	// ...and ends below 85%.
+	if step(70, time.Minute) != nil {
+		t.Fatal("episode should be over")
+	}
 	step(95, time.Second)
 	if step(95, 2*time.Minute) == nil {
-		t.Fatal("expected a new alert after recovering and climbing again")
+		t.Fatal("expected a new episode after recovering and climbing again")
 	}
 }
 
@@ -67,9 +65,22 @@ func TestMemoryDetector_ZeroSustainAlertsImmediately(t *testing.T) {
 	}
 }
 
+func TestMemoryDetector_StoppedContainerStaysInEpisode(t *testing.T) {
+	d := NewMemoryDetector(90, 0)
+	d.Check(memSnap(99))
+	stopped := ContainerSnapshot{ID: "c1", Name: "api", Status: "exited"}
+	if d.Check(stopped) == nil {
+		t.Fatal("stopping mid-episode shouldn't count as recovery")
+	}
+	// Back up and measured low: over.
+	if d.Check(memSnap(10)) != nil {
+		t.Fatal("episode should end once usage is measured low")
+	}
+}
+
 func TestMemoryDetector_SkipsUnlimitedAndForgets(t *testing.T) {
 	d := NewMemoryDetector(90, 0)
-	if d.Check(ContainerSnapshot{ID: "c1", MemoryUsed: 99 * mib}) != nil {
+	if d.Check(ContainerSnapshot{ID: "c1", Status: "running", MemoryUsed: 99 * mib}) != nil {
 		t.Fatal("container without a limit reported")
 	}
 	d.Check(memSnap(10))

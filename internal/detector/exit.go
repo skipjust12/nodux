@@ -8,7 +8,9 @@ import "fmt"
 // The daemon doesn't record whether a stop was requested, but the event
 // stream shows it: docker stop / kill / restart / rm -f all emit one or
 // more "kill" events before "die", while a crash is a bare "die". So a
-// "die" is only reported if no "kill" was seen since the last "start".
+// "die" is only reported if no stopping "kill" was seen since the last
+// "start". A "kill" with a signal the process is meant to survive
+// (docker kill -s HUP) doesn't count as a stop.
 //
 // An OOM kill also ends in "die" (exit 137) right after the "oom" event;
 // when the OOM detector is enabled that exit is left to it, so the same
@@ -16,9 +18,9 @@ import "fmt"
 type ExitDetector struct {
 	ignoreCodes map[int]struct{}
 	skipOOM     bool
-	// Per-container flags, reset on "start" and dropped on "destroy".
-	killed map[string]bool
-	oomed  map[string]bool
+	// Per-container state, reset on "start" and dropped on "destroy".
+	stops stopTracker
+	oomed map[string]bool
 }
 
 func NewExitDetector(ignoreExitCodes []int, skipOOM bool) *ExitDetector {
@@ -29,7 +31,7 @@ func NewExitDetector(ignoreExitCodes []int, skipOOM bool) *ExitDetector {
 	return &ExitDetector{
 		ignoreCodes: ignore,
 		skipOOM:     skipOOM,
-		killed:      make(map[string]bool),
+		stops:       make(stopTracker),
 		oomed:       make(map[string]bool),
 	}
 }
@@ -37,16 +39,14 @@ func NewExitDetector(ignoreExitCodes []int, skipOOM bool) *ExitDetector {
 func (d *ExitDetector) Name() string { return "exit" }
 
 func (d *ExitDetector) HandleEvent(ev ContainerEvent) *Issue {
+	d.stops.observe(ev)
 	switch ev.Action {
 	case "start", "destroy":
-		delete(d.killed, ev.ID)
 		delete(d.oomed, ev.ID)
-	case "kill":
-		d.killed[ev.ID] = true
 	case "oom":
 		d.oomed[ev.ID] = true
 	case "die":
-		if d.killed[ev.ID] {
+		if d.stops[ev.ID] {
 			return nil
 		}
 		oomed := d.oomed[ev.ID]

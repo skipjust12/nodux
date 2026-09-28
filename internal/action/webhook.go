@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skipjust12/nodux/internal/detector"
+	"github.com/skipjust12/nodux/internal/redact"
 )
 
 const (
@@ -22,7 +23,6 @@ const (
 
 	webhookAttempts  = 3
 	webhookQueueSize = 100
-	slackLogLines    = 5
 )
 
 type WebhookConfig struct {
@@ -114,7 +114,7 @@ func (w *WebhookAction) worker() {
 	defer close(w.done)
 	for issue := range w.queue {
 		if err := w.deliver(issue); err != nil {
-			slog.Error("webhook delivery failed", "container", issue.Container.Name, "detector", issue.Detector, "error", err)
+			slog.Error("webhook delivery failed", "url", redact.URL(w.cfg.URL), "detector", issue.Detector, "container", issue.Container.Name, "error", err)
 		}
 	}
 }
@@ -147,7 +147,7 @@ func (w *WebhookAction) deliver(issue detector.Issue) error {
 func (w *WebhookAction) post(body []byte) (retry bool, err error) {
 	req, err := http.NewRequestWithContext(w.ctx, http.MethodPost, w.cfg.URL, bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return false, redact.Err(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "nodux")
@@ -157,7 +157,9 @@ func (w *WebhookAction) post(body []byte) (retry bool, err error) {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return true, err
+		// The URL is often the credential (Slack, Discord): keep it out
+		// of the error, which ends up in the logs.
+		return true, redact.Err(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 300 {
@@ -174,17 +176,4 @@ func (w *WebhookAction) payload(issue detector.Issue) ([]byte, error) {
 		return json.Marshal(map[string]string{"text": slackText(issue)})
 	}
 	return json.Marshal(NewRecord(issue))
-}
-
-func slackText(issue detector.Issue) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "*[%s] %s* on `%s`: %s", strings.ToUpper(issue.Severity), issue.Detector, issue.Container.Name, issue.Message)
-	logs := issue.Logs
-	if len(logs) > slackLogLines {
-		logs = logs[len(logs)-slackLogLines:]
-	}
-	if len(logs) > 0 {
-		b.WriteString("\n```\n" + strings.Join(logs, "\n") + "\n```")
-	}
-	return b.String()
 }

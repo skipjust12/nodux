@@ -1,59 +1,126 @@
-# How often to poll the Docker/Podman socket.
+# nodux configuration. Every setting has a default: an empty file gives
+# you every detector and host check on, alerts on stdout only. This file
+# spells the defaults out; delete what you don't change. Unknown keys
+# are an error, so a typo can't silently fall back to a default.
+
+# Stamped on every alert. Empty = the machine's hostname (inside a
+# container, pass --hostname or set this).
+hostname: ""
+
+# debug, info, warn or error.
+log_level: info
+
+# How often to poll the Docker/Podman socket and check the host.
 poll_interval_seconds: 15
 
-# Don't repeat an alert from the same detector for the same container
-# (by name) within this many minutes. 0 disables the cooldown.
+# One-off alerts (exit, oom) from the same detector for the same
+# container name are not repeated within this many minutes, so a crash
+# loop gives you one exit alert, not one per restart. 0 disables it.
+# Other detectors alert once per episode and send a "resolved" when it's
+# over, so they don't need a cooldown.
 alert_cooldown_minutes: 10
 
 docker:
-  # Docker Desktop / plain Docker on Linux:
+  # Docker on Linux:
   socket_path: /var/run/docker.sock
   # Podman (rootless, example for Linux):
   # socket_path: /run/user/1000/podman/podman.sock
+
+  # Alert when the daemon has been unreachable this long. 0 disables it.
+  down_alert_after_seconds: 60
 
 # Container names that are never checked.
 exclude_containers: []
   # - some-noisy-container
 
 detectors:
-  # Polled: restart count grows too fast.
+  # A container was restarted after a crash restart_threshold times
+  # within window_minutes (manual restarts don't count). Resolved once it
+  # has been running for a whole window without a restart.
   crashloop:
     enabled: true
-    # Fire when a container has restarted restart_threshold times
-    # within the last window_minutes.
     restart_threshold: 3
     window_minutes: 5
 
-  # Polled: the container's HEALTHCHECK reports "unhealthy".
+  # The container's HEALTHCHECK reports "unhealthy" (running containers
+  # only). Resolved when it's healthy again.
   unhealthy:
     enabled: true
 
-  # Event-driven: the kernel OOM killer hit the container's memory limit.
+  # The kernel OOM killer hit the container's memory limit.
   oom:
     enabled: true
 
-  # Event-driven: the main process exited with a non-zero code on its
-  # own. Stops/kills issued through docker (stop, kill, restart, rm -f,
-  # compose down) are never reported.
+  # The main process exited with a non-zero code on its own. Stops and
+  # kills issued through docker (stop, kill, restart, rm -f, compose
+  # down) are never reported; docker kill -s HUP and friends don't count
+  # as a stop.
   exit:
     enabled: true
     ignore_exit_codes: [0]
 
-  # Polled: memory usage (minus reclaimable page cache, same as
-  # docker stats) stays at or above threshold_percent of the container's
-  # memory limit for for_seconds. The early warning before "oom".
-  # Only containers started with a memory limit (-m / mem_limit) are
-  # checked; adds one stats API call per such container per poll.
+  # Memory usage (minus reclaimable page cache, same as docker stats)
+  # stays at or above threshold_percent of the container's memory limit
+  # for for_seconds. The early warning before "oom". Only containers
+  # started with a memory limit (-m / mem_limit) are checked; adds one
+  # stats API call per such container per poll.
   memory:
     enabled: true
     threshold_percent: 90
     for_seconds: 60
 
+  # These containers must be running. Catches what nothing else does: a
+  # container that exited with code 0, or wasn't started after a reboot.
+  # A container has to be down for grace_seconds before it's reported,
+  # so a compose recreate doesn't trigger it.
+  expected:
+    enabled: true
+    containers: []
+      # - postgres
+      # - api
+    grace_seconds: 60
+
+# Host checks. They keep running while the Docker daemon is down.
+host:
+  # Where the host's /proc is. In a container, /proc/stat and
+  # /proc/meminfo already describe the host.
+  proc_path: /proc
+
+  # Filesystem at or above threshold_percent full, by space or inodes.
+  # In a container, mount the host's filesystems (e.g. -v /:/host:ro)
+  # and list them here (/host).
+  disk:
+    enabled: true
+    paths: [/]
+    threshold_percent: 90
+
+  # Host memory in use (MemTotal - MemAvailable).
+  memory:
+    enabled: true
+    threshold_percent: 90
+    for_seconds: 300
+
+  # CPU busy time (steal counts as busy, iowait doesn't).
+  cpu:
+    enabled: true
+    threshold_percent: 95
+    for_seconds: 600
+
+# Alert messages and logs are scrubbed before they go to a webhook or
+# the LLM. defaults covers password=..., bearer tokens, credentials in
+# URLs and common key formats (AWS, GitHub, Slack, sk-...).
+redact:
+  defaults: true
+  # Extra regular expressions. A group named "secret" masks only that
+  # group: 'session=(?P<secret>\w+)' -> 'session=[REDACTED]'.
+  patterns: []
+
 # Where alerts go. Console (JSON lines on stdout) is always on.
 actions:
   webhook:
     enabled: false
-    # $VAR / ${VAR} are expanded from the environment, in url and headers.
+    # $VAR / ${VAR} are expanded from the environment in url and
+    # headers; a variable that's unset or empty is a startup error.
     url: https://hooks.slack.com/services/${NODUX_SLACK_PATH}
     # json: POST the full alert record (same as the console line).
     # slack: POST {"text": ...}; also works for Mattermost, Rocket.Chat,
@@ -63,6 +130,21 @@ actions:
     headers: {}
       # Authorization: Bearer ${NODUX_WEBHOOK_TOKEN}
 
-# Stub for the optional future LLM layer (does nothing yet).
+# A dead man's switch: GET this URL every interval_seconds while nodux
+# can reach the Docker daemon. Point it at healthchecks.io, an Uptime
+# Kuma push monitor, etc.; if nodux dies, or loses the daemon, the pings
+# stop and that service alerts you.
+heartbeat:
+  enabled: false
+  url: https://hc-ping.com/${NODUX_HEARTBEAT_UUID}
+  interval_seconds: 60
+
+# Optional: have Claude read container alerts and their (redacted) logs
+# and add a short probable-cause note. Detection doesn't depend on it.
 llm:
   enabled: false
+  api_key: ${ANTHROPIC_API_KEY}
+  model: claude-opus-5-5
+  timeout_seconds: 30
+  # Alerts over the cap go out without an analysis. 0 = no cap.
+  max_per_hour: 30

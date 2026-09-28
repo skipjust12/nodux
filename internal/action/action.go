@@ -1,7 +1,7 @@
 // Package action defines the contract for reacting to detected
-// problems. Right now there's only ConsoleAction (print to stdout), but
-// the interface is meant to let us add actions like Slack/webhook/restart
-// later without touching the engine.
+// problems: ConsoleAction (JSON lines on stdout) and WebhookAction
+// (HTTP POST, JSON or Slack-style). New actions plug in without
+// touching the engine.
 package action
 
 import (

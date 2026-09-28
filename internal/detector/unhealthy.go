@@ -8,35 +8,30 @@ import (
 
 const maxHealthOutput = 300
 
-// UnhealthyDetector fires when a container's healthcheck reports
-// "unhealthy". It alerts once per unhealthy episode: the next alert only
-// comes after the container has been seen healthy (or starting) again.
+// UnhealthyDetector fires while a container's healthcheck reports
+// "unhealthy". The episode ends when Docker reports it healthy (or
+// starting, after a restart) again.
 //
 // Unlike crashloop, an already-unhealthy container is reported on first
 // sight: it's an ongoing state, not a past event, so it's still actionable.
-type UnhealthyDetector struct {
-	alerted map[string]bool
-	now     func() time.Time
-}
+//
+// Only running containers count: Docker marks a container with a
+// healthcheck unhealthy when it stops, including on a plain docker stop.
+// A container that shouldn't have stopped is exit's or expected's to
+// report.
+type UnhealthyDetector struct{}
 
-func NewUnhealthyDetector() *UnhealthyDetector {
-	return &UnhealthyDetector{alerted: make(map[string]bool), now: time.Now}
-}
+func NewUnhealthyDetector() *UnhealthyDetector { return &UnhealthyDetector{} }
 
 func (d *UnhealthyDetector) Name() string { return "unhealthy" }
 
 func (d *UnhealthyDetector) Check(s ContainerSnapshot) *Issue {
-	if s.HealthStatus != "unhealthy" {
-		delete(d.alerted, s.ID)
+	if s.HealthStatus != "unhealthy" || s.Status != "running" {
 		return nil
 	}
-	if d.alerted[s.ID] {
-		return nil
-	}
-	d.alerted[s.ID] = true
 
 	msg := fmt.Sprintf("healthcheck failing (%d consecutive failures)", s.HealthFailingStreak)
-	if out := truncate(strings.TrimSpace(s.HealthLastOutput), maxHealthOutput); out != "" {
+	if out := Truncate(strings.TrimSpace(s.HealthLastOutput), maxHealthOutput); out != "" {
 		msg += ": " + out
 	}
 
@@ -45,17 +40,6 @@ func (d *UnhealthyDetector) Check(s ContainerSnapshot) *Issue {
 		Severity:   SeverityWarning,
 		Message:    msg,
 		Container:  s,
-		DetectedAt: d.now(),
+		DetectedAt: time.Now(),
 	}
-}
-
-func (d *UnhealthyDetector) Forget(containerID string) {
-	delete(d.alerted, containerID)
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
