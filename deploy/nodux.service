@@ -1,0 +1,49 @@
+# systemd unit for nodux with Docker.
+#
+#   install -m 755 nodux /usr/local/bin/nodux
+#   install -d /etc/nodux && install -m 644 config.example.yaml /etc/nodux/config.yaml
+#   install -m 600 /dev/null /etc/nodux/env   # secrets: NODUX_SLACK_PATH=..., ANTHROPIC_API_KEY=...
+#   install -m 644 deploy/nodux.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now nodux
+#   journalctl -u nodux -f
+#
+# Alerts are JSON lines on stdout, so they end up in the journal too.
+#
+# Access to the Docker socket comes from the docker group, which is
+# root-equivalent on the host, so the hardening below limits what a
+# compromised nodux could do directly, not through the Docker API.
+# For rootful Podman (/run/podman/podman.sock, root-only) drop
+# DynamicUser and SupplementaryGroups and run as root.
+
+[Unit]
+Description=nodux container and host monitor
+Documentation=https://github.com/skipjust12/nodux
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nodux --config /etc/nodux/config.yaml
+EnvironmentFile=-/etc/nodux/env
+Restart=always
+RestartSec=5
+
+DynamicUser=yes
+SupplementaryGroups=docker
+NoNewPrivileges=yes
+ProtectSystem=strict
+# read-only rather than yes, so disk checks can still statfs /home.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

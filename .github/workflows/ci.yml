@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'ed:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: build (linux/amd64, linux/arm64)
+        run: |
+          CGO_ENABLED=0 GOARCH=amd64 go build -o /dev/null ./cmd/nodux
+          CGO_ENABLED=0 GOARCH=arm64 go build -o /dev/null ./cmd/nodux
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t nodux:ci .
+      - run: docker run --rm nodux:ci --version

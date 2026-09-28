@@ -1,0 +1,6 @@
+.git
+.github
+/bin
+/nodux
+/dist
+config.yaml
