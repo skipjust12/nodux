@@ -145,7 +145,7 @@ func (s *Server) list(w http.ResponseWriter) {
 	out := []dockerclient.ContainerSummary{}
 	for _, id := range s.order {
 		c := s.containers[id]
-		out = append(out, dockerclient.ContainerSummary{ID: c.ID, Names: []string{c.Name}, State: c.State.Status})
+		out = append(out, dockerclient.ContainerSummary{ID: c.ID, Names: []string{c.Name}, State: c.State.Status, Labels: c.Config.Labels})
 	}
 	json.NewEncoder(w).Encode(out)
 }

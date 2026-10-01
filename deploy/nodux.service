@@ -6,6 +6,7 @@
 #   install -m 644 deploy/nodux.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now nodux
 #   journalctl -u nodux -f
+#   sudo nodux status
 #
 # Alerts are JSON lines on stdout, so they end up in the journal too.
 #
@@ -29,6 +30,8 @@ RestartSec=5
 
 DynamicUser=yes
 SupplementaryGroups=docker
+# The control socket for nodux status / silence: /run/nodux/nodux.sock.
+RuntimeDirectory=nodux
 NoNewPrivileges=yes
 ProtectSystem=strict
 # read-only rather than yes, so disk checks can still statfs /home.

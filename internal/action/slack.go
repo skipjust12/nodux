@@ -18,11 +18,7 @@ const (
 // Discord accepts: log lines are dropped oldest-first until it fits.
 func slackText(issue detector.Issue) string {
 	var head strings.Builder
-	label := strings.ToUpper(issue.Severity)
-	if issue.Resolved {
-		label = "RESOLVED"
-	}
-	fmt.Fprintf(&head, "*[%s] %s*", label, issue.Detector)
+	fmt.Fprintf(&head, "*%s*", headline(issue))
 	if s := subject(issue); s != "" {
 		fmt.Fprintf(&head, " `%s`", escapeCode(s))
 	}
@@ -35,13 +31,9 @@ func slackText(issue detector.Issue) string {
 	}
 	text := detector.Truncate(head.String(), slackMaxMessage)
 
-	logs := issue.Logs
-	if len(logs) > slackLogLines {
-		logs = logs[len(logs)-slackLogLines:]
-	}
-	lines := make([]string, len(logs))
-	for i, l := range logs {
-		lines[i] = escapeCode(detector.Truncate(l, slackLineMax))
+	lines := lastLines(issue.Logs, slackLogLines, slackLineMax)
+	for i, l := range lines {
+		lines[i] = escapeCode(l)
 	}
 	for len(lines) > 0 {
 		block := "\n```\n" + strings.Join(lines, "\n") + "\n```"
@@ -51,6 +43,28 @@ func slackText(issue detector.Issue) string {
 		lines = lines[1:]
 	}
 	return text
+}
+
+// headline is "[CRITICAL] crashloop", or "[RESOLVED] crashloop".
+func headline(issue detector.Issue) string {
+	label := strings.ToUpper(issue.Severity)
+	if issue.Resolved {
+		label = "RESOLVED"
+	}
+	return fmt.Sprintf("[%s] %s", label, issue.Detector)
+}
+
+// lastLines returns up to n of the newest log lines, each cut to max
+// bytes, in a fresh slice.
+func lastLines(logs []string, n, max int) []string {
+	if len(logs) > n {
+		logs = logs[len(logs)-n:]
+	}
+	out := make([]string, len(logs))
+	for i, l := range logs {
+		out[i] = detector.Truncate(l, max)
+	}
+	return out
 }
 
 func subject(issue detector.Issue) string {

@@ -69,6 +69,15 @@ detectors:
     threshold_percent: 90
     for_seconds: 60
 
+  # A container with a CPU limit (--cpus, cpus: in compose) was
+  # throttled in at least threshold_percent of its CFS scheduling periods
+  # for for_seconds: it needs more CPU than it's allowed, the classic
+  # "slow but not crashing". Shares the stats call with "memory".
+  cpu_throttle:
+    enabled: true
+    threshold_percent: 25
+    for_seconds: 300
+
   # These containers must be running. Catches what nothing else does: a
   # container that exited with code 0, or wasn't started after a reboot.
   # A container has to be down for grace_seconds before it's reported,
@@ -82,8 +91,8 @@ detectors:
 
 # Host checks. They keep running while the Docker daemon is down.
 host:
-  # Where the host's /proc is. In a container, /proc/stat and
-  # /proc/meminfo already describe the host.
+  # Where the host's /proc is. In a container, /proc/stat, /proc/meminfo,
+  # /proc/vmstat and /proc/pressure already describe the host.
   proc_path: /proc
 
   # Filesystem at or above threshold_percent full, by space or inodes.
@@ -93,6 +102,14 @@ host:
     enabled: true
     paths: [/]
     threshold_percent: 90
+    # Predict when each path fills up from how fast it has been filling
+    # over the last window_minutes; alert when that's under
+    # horizon_hours away ("/ will be full in ~6h"). Needs a quarter of
+    # the window of samples before it says anything.
+    forecast:
+      enabled: true
+      window_minutes: 60
+      horizon_hours: 12
 
   # Host memory in use (MemTotal - MemAvailable).
   memory:
@@ -106,6 +123,53 @@ host:
     threshold_percent: 95
     for_seconds: 600
 
+  # Pressure stall information (/proc/pressure, Linux 4.20+): the share
+  # of the last minute (avg60) that tasks spent stalled waiting for a
+  # resource. "some" = at least one task, "full" = all non-idle tasks at
+  # once. memory some catches thrashing before the OOM killer runs; io
+  # full catches a dying disk or a noisy neighbour on shared storage.
+  # 0 turns a signal off.
+  pressure:
+    enabled: true
+    memory_some_percent: 10
+    memory_full_percent: 0
+    io_some_percent: 0
+    io_full_percent: 10
+    cpu_some_percent: 0
+    for_seconds: 60
+
+  # The kernel OOM killer killed something that isn't in a container
+  # (the oom_kill counter in /proc/vmstat moved, and no container OOM
+  # event accounts for it): host RAM ran out, or a systemd unit hit its
+  # MemoryMax. Container OOMs are the "oom" detector's.
+  oom:
+    enabled: true
+
+# Check that services answer, from nodux's point of view. For a
+# container without a HEALTHCHECK this is the only way to know the
+# service works. https and tls probes also watch certificate expiry.
+probes:
+  interval_seconds: 30
+  timeout_seconds: 5
+  # Checks in a row that must fail before alerting.
+  failures: 2
+  # Certificate expiry: a warning this many days out, critical this many
+  # days out (the episode escalates). 0 disables expiry alerts.
+  cert_warn_days: 14
+  cert_critical_days: 3
+  targets: []
+    # - name: api
+    #   url: http://127.0.0.1:8080/healthz   # GET; redirects aren't followed
+    #   status: [200]                        # default: any 2xx/3xx
+    #   container: api                       # attach this container's logs
+    # - name: site
+    #   url: https://example.com/            # also tracks the certificate
+    # - name: postgres
+    #   tcp: 127.0.0.1:5432                  # connect only
+    # - name: mail
+    #   tls: mail.example.com:465            # handshake + certificate
+    #   # tls_skip_verify: true              # self-signed; expiry still checked
+
 # Alert messages and logs are scrubbed before they go to a webhook or
 # the LLM. defaults covers password=..., bearer tokens, credentials in
 # URLs and common key formats (AWS, GitHub, Slack, sk-...).
@@ -117,6 +181,30 @@ redact:
 
 # Where alerts go. Console (JSON lines on stdout) is always on.
 actions:
+  # Receivers, each with its own routing: severities ([warning],
+  # [critical], or empty for both), detectors (globs, empty = all) and
+  # send_resolved (default true). $VAR / ${VAR} are expanded from the
+  # environment in urls, tokens, chat_id and headers.
+  receivers: []
+    # - name: oncall
+    #   type: telegram
+    #   bot_token: ${NODUX_TELEGRAM_TOKEN}
+    #   chat_id: "-1001234567890"     # or @channelname
+    #   # thread_id: 42               # a forum topic
+    #   severities: [critical]
+    # - name: phone
+    #   type: ntfy
+    #   url: https://ntfy.sh/${NODUX_NTFY_TOPIC}
+    #   # token: ${NODUX_NTFY_TOKEN}  # protected topics
+    #   severities: [critical]
+    # - name: team
+    #   type: webhook
+    #   url: https://hooks.slack.com/services/${NODUX_SLACK_PATH}
+    #   format: slack                 # or json (the full alert record)
+    #   severities: [warning]
+
+  # A single webhook that gets every alert (the pre-receivers way to
+  # configure one; it still works).
   webhook:
     enabled: false
     # $VAR / ${VAR} are expanded from the environment in url and
@@ -129,6 +217,23 @@ actions:
     timeout_seconds: 5
     headers: {}
       # Authorization: Bearer ${NODUX_WEBHOOK_TOKEN}
+
+silences:
+  # Deploys mute alerts by themselves: create, stop and remove events for
+  # a container (compose up, docker run, docker stop, docker rm) silence
+  # it and the rest of its compose project until this long after the
+  # last one. An alert still open when the window closes goes out then.
+  # 0 disables it. Manual silences: nodux silence api 30m.
+  deploy_grace_seconds: 120
+
+server:
+  # Control socket for nodux status and nodux silence. Empty disables
+  # it; if it can't be created, nodux runs without it.
+  socket_path: /run/nodux/nodux.sock
+  # TCP address for /metrics (Prometheus) and /healthz, e.g.
+  # 127.0.0.1:9321. Empty disables it. The silence API is never served
+  # here.
+  listen: ""
 
 # A dead man's switch: GET this URL every interval_seconds while nodux
 # can reach the Docker daemon. Point it at healthchecks.io, an Uptime

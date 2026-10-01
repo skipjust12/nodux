@@ -1,7 +1,8 @@
 // Package action defines the contract for reacting to detected
-// problems: ConsoleAction (JSON lines on stdout) and WebhookAction
-// (HTTP POST, JSON or Slack-style). New actions plug in without
-// touching the engine.
+// problems: ConsoleAction (JSON lines on stdout) and the receivers built
+// on HTTPAction (webhook, Telegram, ntfy), each behind a Route that
+// decides which alerts it gets. New actions plug in without touching
+// the engine.
 package action
 
 import (

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -56,6 +57,37 @@ type Anthropic struct {
 	maxPerHour int
 	calls      []time.Time
 	now        func() time.Time
+
+	ok, failed, overBudget atomic.Uint64
+}
+
+// Usage describes the classifier's budget and results so far.
+type Usage struct {
+	// MaxPerHour is the hourly cap, 0 = none; Remaining is what's left
+	// of it right now.
+	MaxPerHour int `json:"max_per_hour"`
+	Remaining  int `json:"remaining"`
+	// Counts since startup.
+	OK         uint64 `json:"ok"`
+	Failed     uint64 `json:"failed"`
+	OverBudget uint64 `json:"over_budget"`
+}
+
+func (a *Anthropic) Usage() Usage {
+	a.mu.Lock()
+	a.pruneLocked()
+	used := len(a.calls)
+	a.mu.Unlock()
+	u := Usage{
+		MaxPerHour: a.maxPerHour,
+		OK:         a.ok.Load(),
+		Failed:     a.failed.Load(),
+		OverBudget: a.overBudget.Load(),
+	}
+	if a.maxPerHour > 0 {
+		u.Remaining = max(a.maxPerHour-used, 0)
+	}
+	return u
 }
 
 func NewAnthropic(cfg AnthropicConfig) *Anthropic {
@@ -80,8 +112,19 @@ func NewAnthropic(cfg AnthropicConfig) *Anthropic {
 
 func (a *Anthropic) Classify(ctx context.Context, issue detector.Issue) (string, error) {
 	if !a.allow() {
+		a.overBudget.Add(1)
 		return "", ErrBudgetExhausted
 	}
+	analysis, err := a.classify(ctx, issue)
+	if err != nil {
+		a.failed.Add(1)
+	} else {
+		a.ok.Add(1)
+	}
+	return analysis, err
+}
+
+func (a *Anthropic) classify(ctx context.Context, issue detector.Issue) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
@@ -127,8 +170,16 @@ func (a *Anthropic) allow() bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	now := a.now()
-	cutoff := now.Add(-time.Hour)
+	a.pruneLocked()
+	if len(a.calls) >= a.maxPerHour {
+		return false
+	}
+	a.calls = append(a.calls, a.now())
+	return true
+}
+
+func (a *Anthropic) pruneLocked() {
+	cutoff := a.now().Add(-time.Hour)
 	kept := a.calls[:0]
 	for _, t := range a.calls {
 		if t.After(cutoff) {
@@ -136,11 +187,6 @@ func (a *Anthropic) allow() bool {
 		}
 	}
 	a.calls = kept
-	if len(a.calls) >= a.maxPerHour {
-		return false
-	}
-	a.calls = append(a.calls, now)
-	return true
 }
 
 func prompt(issue detector.Issue) string {

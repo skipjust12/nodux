@@ -10,7 +10,9 @@ const rearmGap = 5.0
 
 // gate turns a stream of percentages into a firing state: it opens once
 // the value has stayed at or above threshold for sustain, and closes
-// once it drops below threshold - rearmGap.
+// once it drops below threshold - rearmGap. For thresholds under 10 the
+// gap is half the threshold, so a low threshold (a PSI stall of 4%)
+// can still close.
 type gate struct {
 	threshold  float64
 	sustain    time.Duration
@@ -20,7 +22,7 @@ type gate struct {
 
 func (g *gate) update(now time.Time, value float64) bool {
 	if g.firing {
-		if value < g.threshold-rearmGap {
+		if value < g.threshold-min(rearmGap, g.threshold/2) {
 			g.firing = false
 			g.aboveSince = time.Time{}
 		}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/skipjust12/nodux/internal/dockerclient"
 	"github.com/skipjust12/nodux/internal/dockertest"
 	"github.com/skipjust12/nodux/internal/redact"
+	"github.com/skipjust12/nodux/internal/silence"
 )
 
 type recorder struct {
@@ -516,5 +519,283 @@ func TestFormatDuration(t *testing.T) {
 		if got := formatDuration(d); got != want {
 			t.Errorf("formatDuration(%s) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+func TestEngine_UnhealthyEventAlertsBeforeThePoll(t *testing.T) {
+	srv := dockertest.New(t)
+	web := container("c1", "web", "running")
+	web.State.Health = &dockerclient.Health{Status: "healthy"}
+	srv.AddContainer(web, "GET /health 503")
+	stream := srv.NewStream()
+
+	u := detector.NewUnhealthyDetector()
+	rec, eng := startEngine(t, srv, Options{
+		Detectors:      []detector.Detector{u},
+		EventDetectors: []detector.EventDetector{u},
+		PollInterval:   time.Hour, // only the first poll runs
+	})
+	waitFor(t, func() bool { return !eng.LastPoll().IsZero() })
+
+	sick := container("c1", "web", "running")
+	sick.State.Health = &dockerclient.Health{Status: "unhealthy", FailingStreak: 3, Log: []dockerclient.HealthLog{{ExitCode: 1, Output: "503\n"}}}
+	srv.AddContainer(sick, "GET /health 503")
+	stream <- event("c1", "web", "health_status: unhealthy", nil, time.Now())
+
+	issue := rec.next(t)
+	if issue.Detector != "unhealthy" || issue.Message != "healthcheck failing (3 consecutive failures): 503" || len(issue.Logs) != 1 {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	if eps := eng.Episodes(); len(eps) != 1 || eps[0].Container != "web" || eps[0].Silenced {
+		t.Fatalf("episodes = %+v", eps)
+	}
+	// healthy events don't alert; a second unhealthy event is the same episode.
+	stream <- event("c1", "web", "health_status: healthy", nil, time.Now())
+	stream <- event("c1", "web", "health_status: unhealthy", nil, time.Now())
+	rec.none(t, 100*time.Millisecond)
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for condition")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestEngine_StaleObservationDoesNotCloseNewerEpisode(t *testing.T) {
+	eng := New(nil, Options{})
+	before := time.Now()
+	time.Sleep(time.Millisecond)
+	if eng.track("unhealthy/c1", &detector.Issue{Detector: "unhealthy", Message: "m"}, nil) == nil {
+		t.Fatal("episode not opened")
+	}
+	if r := eng.trackAt("unhealthy/c1", nil, nil, before); r != nil {
+		t.Fatalf("closed by a snapshot taken before it opened: %+v", r)
+	}
+	if r := eng.trackAt("unhealthy/c1", nil, nil, time.Now()); r == nil || !r.Resolved {
+		t.Fatalf("not closed by a fresh snapshot: %+v", r)
+	}
+}
+
+func TestEngine_CPUThrottling(t *testing.T) {
+	srv := dockertest.New(t)
+	limited := container("t1", "api", "running")
+	limited.HostConfig.NanoCPUs = 500_000_000
+	srv.AddContainer(limited)
+	srv.AddContainer(container("u1", "free", "running"))
+
+	var mu sync.Mutex
+	periods := uint64(0)
+	setStats := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		periods += 100
+		st := &dockerclient.Stats{}
+		st.CPUStats.ThrottlingData.Periods = periods
+		st.CPUStats.ThrottlingData.ThrottledPeriods = periods * 8 / 10
+		srv.SetStats("t1", st)
+	}
+	setStats()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+				setStats()
+			}
+		}
+	}()
+
+	rec := start(t, srv, Options{
+		Detectors:         []detector.Detector{detector.NewThrottleDetector(25, 0)},
+		CollectThrottling: true,
+	})
+	issue := rec.next(t)
+	if issue.Detector != "cpu_throttle" || issue.Container.Name != "api" || !strings.Contains(issue.Message, "at a limit of 0.5 CPUs") {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	if srv.StatsCallCount("u1") != 0 {
+		t.Error("stats fetched for a container without a CPU limit")
+	}
+}
+
+func TestEngine_HostOOM(t *testing.T) {
+	srv := dockertest.New(t)
+	stream := srv.NewStream()
+	proc := t.TempDir()
+	vmstat := func(n int) {
+		if err := os.WriteFile(filepath.Join(proc, "vmstat"), []byte(fmt.Sprintf("oom_kill %d\n", n)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vmstat(0)
+	oom := detector.NewHostOOMDetector(proc, 50*time.Millisecond, 0)
+	rec, eng := startEngine(t, srv, Options{HostOOM: oom, ExcludeContainers: []string{"hog"}})
+	waitFor(t, func() bool { return !eng.LastPoll().IsZero() })
+
+	// An OOM in a container (excluded, even) is not a host OOM.
+	stream <- event("h1", "hog", "oom", nil, time.Now())
+	time.Sleep(20 * time.Millisecond)
+	vmstat(1)
+	rec.none(t, 200*time.Millisecond)
+
+	vmstat(2)
+	issue := rec.next(t)
+	if issue.Detector != "host_oom" || issue.Severity != detector.SeverityCritical || !strings.Contains(issue.Message, "killed a process outside any container") {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	rec.none(t, 100*time.Millisecond)
+}
+
+func TestEngine_SilenceHoldsAlertAndReleasesIt(t *testing.T) {
+	srv := dockertest.New(t)
+	sick := container("c1", "web", "running")
+	sick.State.Health = &dockerclient.Health{Status: "unhealthy", FailingStreak: 1}
+	srv.AddContainer(sick, "boom")
+
+	store := silence.New()
+	sil, err := store.Add(silence.Matcher{Target: "web"}, time.Hour, "deploying")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, eng := startEngine(t, srv, Options{Detectors: []detector.Detector{detector.NewUnhealthyDetector()}, Silences: store})
+
+	issue := rec.next(t)
+	if !issue.Silenced || issue.Logs != nil {
+		t.Fatalf("alert should be silenced and without logs: %+v", issue)
+	}
+	if eps := eng.Episodes(); len(eps) != 1 || !eps[0].Silenced {
+		t.Fatalf("episodes = %+v", eps)
+	}
+	rec.none(t, 100*time.Millisecond)
+
+	// Silence over, problem still there: the alert goes out now.
+	store.Remove(sil.ID)
+	issue = rec.next(t)
+	if issue.Silenced || issue.Resolved || !strings.Contains(issue.Message, "held back by a silence") || len(issue.Logs) != 1 {
+		t.Fatalf("deferred alert: %+v", issue)
+	}
+	rec.none(t, 100*time.Millisecond)
+
+	// Resolved during a new silence: the resolution still goes out,
+	// since the alert did.
+	store.Add(silence.Matcher{Target: "*"}, time.Hour, "")
+	healthy := container("c1", "web", "running")
+	srv.AddContainer(healthy)
+	if issue := rec.next(t); !issue.Resolved || issue.Silenced {
+		t.Fatalf("resolution: %+v", issue)
+	}
+
+	// An episode that opens and ends inside a silence is never heard of.
+	srv.AddContainer(sick)
+	if issue := rec.next(t); !issue.Silenced {
+		t.Fatalf("expected a silenced alert: %+v", issue)
+	}
+	srv.AddContainer(healthy)
+	if issue := rec.next(t); !issue.Resolved || !issue.Silenced {
+		t.Fatalf("resolution of a silenced episode should be silenced: %+v", issue)
+	}
+	counts := eng.AlertCounts()
+	if counts[AlertKey{Detector: "unhealthy", Severity: "warning", State: "firing", Silenced: true}] != 2 ||
+		counts[AlertKey{Detector: "unhealthy", Severity: "warning", State: "resolved"}] != 1 {
+		t.Errorf("counts = %v", counts)
+	}
+}
+
+func TestEngine_DeployWindowSilencesProject(t *testing.T) {
+	srv := dockertest.New(t)
+	web := container("c1", "shop-web-1", "running")
+	web.Config.Labels = map[string]string{dockerclient.ProjectLabel: "shop"}
+	srv.AddContainer(web)
+	db := container("c2", "shop-db-1", "running")
+	db.Config.Labels = map[string]string{dockerclient.ProjectLabel: "shop"}
+	srv.AddContainer(db)
+	stream := srv.NewStream()
+
+	store := silence.New()
+	rec, eng := startEngine(t, srv, Options{
+		Detectors:      []detector.Detector{detector.NewUnhealthyDetector()},
+		EventDetectors: []detector.EventDetector{detector.NewExitDetector([]int{0}, true)},
+		Silences:       store,
+		DeployGrace:    time.Hour,
+	})
+	waitFor(t, func() bool { return !eng.LastPoll().IsZero() })
+
+	// compose up recreates the web container...
+	stream <- event("c3", "shop-web-1", "create", map[string]string{dockerclient.ProjectLabel: "shop"}, time.Now())
+	waitFor(t, func() bool { return len(store.Windows()) == 2 })
+
+	// ...and the db goes unhealthy meanwhile: same project, silenced.
+	sick := container("c2", "shop-db-1", "running")
+	sick.Config.Labels = db.Config.Labels
+	sick.State.Health = &dockerclient.Health{Status: "unhealthy"}
+	srv.AddContainer(sick)
+	if issue := rec.next(t); issue.Container.Name != "shop-db-1" || !issue.Silenced {
+		t.Fatalf("expected a silenced alert: %+v", issue)
+	}
+
+	// The new web container crashes right away: a deploy doesn't cause
+	// crashes, and a one-off alert held back would be lost, so it's sent.
+	stream <- event("c3", "shop-web-1", "die", map[string]string{"exitCode": "1", dockerclient.ProjectLabel: "shop"}, time.Now())
+	if issue := rec.next(t); issue.Detector != "exit" || issue.Silenced {
+		t.Fatalf("a crash during a deploy must not be silenced: %+v", issue)
+	}
+}
+
+type fakeProbe struct{ fakeHost }
+
+func (f *fakeProbe) Name() string { return "probe" }
+
+func TestEngine_ProbeTiedToContainerGetsItsLogs(t *testing.T) {
+	srv := dockertest.New(t)
+	api := container("c1", "api", "running")
+	api.RestartCount = 4
+	srv.AddContainer(api, "listening on :8080", "panic: out of file descriptors")
+	probe := &fakeProbe{}
+	rec, eng := startEngine(t, srv, Options{Probes: []detector.HostDetector{probe}, ProbeInterval: 20 * time.Millisecond})
+	waitFor(t, func() bool { return !eng.LastPoll().IsZero() })
+
+	probe.set(&detector.Issue{
+		Detector: "probe", Severity: detector.SeverityCritical, Message: "GET http://127.0.0.1:8080/: connection refused",
+		Resource: "api-http", Container: detector.ContainerSnapshot{Name: "api"},
+	})
+	issue := rec.next(t)
+	if issue.Detector != "probe" || issue.Resource != "api-http" || issue.Container.ID != "c1" || issue.Container.RestartCount != 4 {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	if len(issue.Logs) != 2 {
+		t.Errorf("logs = %q", issue.Logs)
+	}
+	rec.none(t, 100*time.Millisecond)
+
+	probe.set()
+	if issue := rec.next(t); !issue.Resolved || issue.Resource != "api-http" {
+		t.Fatalf("resolution: %+v", issue)
+	}
+}
+
+func TestEngine_SeverityEscalationAlertsAgain(t *testing.T) {
+	srv := dockertest.New(t)
+	host := &fakeHost{}
+	host.set(&detector.Issue{Detector: "host_disk", Severity: detector.SeverityWarning, Message: "expires in 10 days", Resource: "example.com"})
+	rec := start(t, srv, Options{HostDetectors: []detector.HostDetector{host}})
+	if issue := rec.next(t); issue.Severity != detector.SeverityWarning {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+	host.set(&detector.Issue{Detector: "host_disk", Severity: detector.SeverityCritical, Message: "expires in 2 days", Resource: "example.com"})
+	if issue := rec.next(t); issue.Severity != detector.SeverityCritical || issue.Resolved {
+		t.Fatalf("expected an escalation: %+v", issue)
+	}
+	rec.none(t, 100*time.Millisecond)
+	host.set()
+	if issue := rec.next(t); !issue.Resolved || !strings.Contains(issue.Message, "was: expires in 2 days") {
+		t.Fatalf("resolution: %+v", issue)
 	}
 }

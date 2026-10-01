@@ -76,3 +76,26 @@ func TestTruncate(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestUnhealthyDetector_Events(t *testing.T) {
+	d := NewUnhealthyDetector()
+	for _, status := range []string{"healthy", "starting"} {
+		if issue := d.HandleEvent(ContainerEvent{ID: "c1", Name: "web", Action: "health_status", HealthStatus: status}); issue != nil {
+			t.Errorf("%s reported: %+v", status, issue)
+		}
+	}
+	issue := d.HandleEvent(ContainerEvent{ID: "c1", Name: "web", Action: "health_status", HealthStatus: "unhealthy"})
+	if issue == nil || issue.Container.ID != "c1" || issue.Message != "healthcheck failing" {
+		t.Fatalf("unexpected issue: %+v", issue)
+	}
+
+	// Inspect fills in the details; a container that stopped in the
+	// meantime is dropped.
+	full := d.Confirm(ContainerSnapshot{ID: "c1", Status: "running", HealthStatus: "unhealthy", HealthFailingStreak: 2, HealthLastOutput: "503"})
+	if full == nil || full.Message != "healthcheck failing (2 consecutive failures): 503" {
+		t.Fatalf("confirmed issue: %+v", full)
+	}
+	if d.Confirm(ContainerSnapshot{ID: "c1", Status: "exited", HealthStatus: "unhealthy"}) != nil {
+		t.Fatal("stopped container confirmed")
+	}
+}
