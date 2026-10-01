@@ -29,6 +29,9 @@ RestartSec=5
 
 DynamicUser=yes
 SupplementaryGroups=docker
+# /var/lib/nodux: open alerts and the alert history (state_dir).
+StateDirectory=nodux
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 ProtectSystem=strict
 # read-only rather than yes, so disk checks can still statfs /home.

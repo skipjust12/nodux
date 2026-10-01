@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skipjust12/nodux/internal/action"
 	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/dockerclient"
 	"github.com/skipjust12/nodux/internal/dockertest"
+	"github.com/skipjust12/nodux/internal/llm"
 	"github.com/skipjust12/nodux/internal/redact"
 )
 
@@ -21,8 +23,10 @@ type recorder struct {
 
 func (r *recorder) Name() string { return "recorder" }
 
-func (r *recorder) Run(_ context.Context, issue detector.Issue) error {
-	r.issues <- issue
+func (r *recorder) Send(_ context.Context, n action.Notification) error {
+	for _, issue := range n.Alerts {
+		r.issues <- issue
+	}
 	return nil
 }
 
@@ -466,12 +470,12 @@ func TestEngine_ExpectedContainers(t *testing.T) {
 	rec.none(t, 100*time.Millisecond)
 }
 
-type fakeClassifier struct {
-	seen chan detector.Issue
+type fakeAnalyzer struct {
+	seen chan llm.Incident
 }
 
-func (f *fakeClassifier) Classify(_ context.Context, issue detector.Issue) (string, error) {
-	f.seen <- issue
+func (f *fakeAnalyzer) Analyze(_ context.Context, inc llm.Incident) (string, error) {
+	f.seen <- inc
 	return "the database is down", nil
 }
 
@@ -484,16 +488,16 @@ func TestEngine_RedactsBeforeClassifyingAndSending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cls := &fakeClassifier{seen: make(chan detector.Issue, 4)}
+	cls := &fakeAnalyzer{seen: make(chan llm.Incident, 4)}
 	rec := start(t, srv, Options{
 		EventDetectors: []detector.EventDetector{detector.NewExitDetector([]int{0}, true)},
 		Redactor:       red,
-		Classifier:     cls,
+		Analyzer:       cls,
 	})
 
 	stream <- event("w1", "worker", "die", map[string]string{"exitCode": "1"}, time.Now())
 	issue := rec.next(t)
-	classified := <-cls.seen
+	classified := (<-cls.seen).Alerts[0]
 
 	for _, is := range []detector.Issue{issue, classified} {
 		if len(is.Logs) != 2 || is.Logs[0] != "connecting with password=[REDACTED]" {

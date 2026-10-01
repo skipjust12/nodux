@@ -110,11 +110,11 @@ func TestExpectedDetector(t *testing.T) {
 	d.now = func() time.Time { return now }
 
 	statuses := map[string]string{"db": "running", "api": "exited", "cron": "exited"}
-	if issues := d.Check(statuses); len(issues) != 0 {
+	if issues := d.Check(statuses, nil); len(issues) != 0 {
 		t.Fatalf("reported within the grace period: %+v", issues)
 	}
 	now = now.Add(time.Minute)
-	issues := d.Check(statuses)
+	issues := d.Check(statuses, nil)
 	if len(issues) != 2 {
 		t.Fatalf("got %+v", issues)
 	}
@@ -127,12 +127,12 @@ func TestExpectedDetector(t *testing.T) {
 
 	// Recreated by compose: briefly missing, back within grace.
 	statuses = map[string]string{"db": "restarting", "api": "running", "worker": "running"}
-	if issues := d.Check(statuses); len(issues) != 0 {
+	if issues := d.Check(statuses, nil); len(issues) != 0 {
 		t.Fatalf("got %+v", issues)
 	}
 	delete(statuses, "db")
 	now = now.Add(30 * time.Second)
-	if issues := d.Check(statuses); len(issues) != 0 {
+	if issues := d.Check(statuses, nil); len(issues) != 0 {
 		t.Fatalf("db reported within grace: %+v", issues)
 	}
 }

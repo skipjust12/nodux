@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/skipjust12/nodux/internal/digest"
 	"github.com/skipjust12/nodux/internal/llm"
 	"github.com/skipjust12/nodux/internal/redact"
 )
@@ -30,15 +32,58 @@ type Config struct {
 	// AlertCooldownMinutes suppresses repeats of one-off alerts (exit,
 	// oom) from the same detector for the same container name. 0
 	// disables the cooldown.
-	AlertCooldownMinutes int             `yaml:"alert_cooldown_minutes"`
-	Docker               DockerConfig    `yaml:"docker"`
-	ExcludeContainers    []string        `yaml:"exclude_containers"`
-	Detectors            DetectorsConfig `yaml:"detectors"`
-	Host                 HostConfig      `yaml:"host"`
-	Redact               RedactConfig    `yaml:"redact"`
-	Actions              ActionsConfig   `yaml:"actions"`
-	Heartbeat            HeartbeatConfig `yaml:"heartbeat"`
-	LLM                  LLMConfig       `yaml:"llm"`
+	AlertCooldownMinutes int `yaml:"alert_cooldown_minutes"`
+	// StateDir keeps open alerts, detector state and the event stream
+	// position (state.json) and the alert history (history.db) across
+	// restarts. Empty keeps everything in memory.
+	StateDir          string          `yaml:"state_dir"`
+	History           HistoryConfig   `yaml:"history"`
+	Docker            DockerConfig    `yaml:"docker"`
+	ExcludeContainers []string        `yaml:"exclude_containers"`
+	Detectors         DetectorsConfig `yaml:"detectors"`
+	Host              HostConfig      `yaml:"host"`
+	Incidents         IncidentsConfig `yaml:"incidents"`
+	Redact            RedactConfig    `yaml:"redact"`
+	Actions           ActionsConfig   `yaml:"actions"`
+	Heartbeat         HeartbeatConfig `yaml:"heartbeat"`
+	LLM               LLMConfig       `yaml:"llm"`
+	Digest            DigestConfig    `yaml:"digest"`
+	ChatOps           ChatOpsConfig   `yaml:"chatops"`
+}
+
+type HistoryConfig struct {
+	// RetentionDays is how long alerts and LLM usage are kept.
+	RetentionDays int `yaml:"retention_days"`
+}
+
+// IncidentsConfig groups related alerts into one message.
+type IncidentsConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// GroupWaitSeconds is how long alerts are held to collect related
+	// ones before they go out.
+	GroupWaitSeconds int `yaml:"group_wait_seconds"`
+	// WindowMinutes: an incident takes related alerts while its last
+	// one is this recent.
+	WindowMinutes int `yaml:"window_minutes"`
+}
+
+type DigestConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Every   string `yaml:"every"`   // daily or weekly
+	At      string `yaml:"at"`      // local time, "09:00"
+	Weekday string `yaml:"weekday"` // for weekly
+}
+
+type ChatOpsConfig struct {
+	Telegram TelegramConfig `yaml:"telegram"`
+}
+
+type TelegramConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Token   string `yaml:"token"`
+	// AllowedChatIDs are the chats the bot answers; everyone else is
+	// ignored.
+	AllowedChatIDs []int64 `yaml:"allowed_chat_ids"`
 }
 
 type DockerConfig struct {
@@ -140,15 +185,21 @@ type HeartbeatConfig struct {
 }
 
 // LLMConfig configures the optional LLM layer that adds a probable-cause
-// analysis to container alerts. Logs are redacted before they're sent.
+// analysis to alerts, answers chat questions and writes the digest's
+// takeaway. Everything it reads is redacted first.
 type LLMConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	APIKey         string `yaml:"api_key"`
-	Model          string `yaml:"model"`
-	BaseURL        string `yaml:"base_url"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
-	// MaxPerHour caps API calls; alerts over the cap go out without an
-	// analysis. 0 = no cap.
+	Enabled bool   `yaml:"enabled"`
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
+	BaseURL string `yaml:"base_url"`
+	Effort  string `yaml:"effort"`
+	// MaxSteps is how many rounds of read-only tool calls one analysis
+	// may make. 0 = no tools, one request per analysis.
+	MaxSteps int `yaml:"max_steps"`
+	// TimeoutSeconds bounds a whole analysis, tool calls included.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// MaxPerHour caps analyses, answers and digest notes; alerts over
+	// the cap go out without an analysis. 0 = no cap.
 	MaxPerHour int `yaml:"max_per_hour"`
 }
 
@@ -183,6 +234,13 @@ func (c *HeartbeatConfig) Interval() time.Duration {
 	return seconds(c.IntervalSeconds)
 }
 func (c *LLMConfig) Timeout() time.Duration { return seconds(c.TimeoutSeconds) }
+func (c *HistoryConfig) Retention() time.Duration {
+	return time.Duration(c.RetentionDays) * 24 * time.Hour
+}
+func (c *IncidentsConfig) GroupWait() time.Duration { return seconds(c.GroupWaitSeconds) }
+func (c *IncidentsConfig) Window() time.Duration {
+	return time.Duration(c.WindowMinutes) * time.Minute
+}
 
 func seconds(n int) time.Duration { return time.Duration(n) * time.Second }
 
@@ -193,6 +251,9 @@ func Default() *Config {
 		LogLevel:             "info",
 		PollIntervalSeconds:  15,
 		AlertCooldownMinutes: 10,
+		StateDir:             "/var/lib/nodux",
+		History:              HistoryConfig{RetentionDays: 30},
+		Incidents:            IncidentsConfig{Enabled: true, GroupWaitSeconds: 30, WindowMinutes: 10},
 		Docker: DockerConfig{
 			SocketPath:            "/var/run/docker.sock",
 			DownAlertAfterSeconds: 60,
@@ -220,9 +281,15 @@ func Default() *Config {
 		LLM: LLMConfig{
 			APIKey:         "${ANTHROPIC_API_KEY}",
 			Model:          llm.DefaultModel,
-			TimeoutSeconds: 30,
+			Effort:         llm.DefaultEffort,
+			MaxSteps:       llm.DefaultMaxSteps,
+			TimeoutSeconds: 90,
 			MaxPerHour:     30,
 		},
+		Digest: DigestConfig{Every: "daily", At: "09:00", Weekday: "monday"},
+		ChatOps: ChatOpsConfig{Telegram: TelegramConfig{
+			Token: "${NODUX_TELEGRAM_TOKEN}",
+		}},
 	}
 }
 
@@ -284,6 +351,9 @@ func (c *Config) expandEnv() error {
 		l.APIKey = expand("llm.api_key", l.APIKey)
 		l.BaseURL = expand("llm.base_url", l.BaseURL)
 	}
+	if tg := &c.ChatOps.Telegram; tg.Enabled {
+		tg.Token = expand("chatops.telegram.token", tg.Token)
+	}
 
 	if len(missing) > 0 {
 		sort.Strings(missing)
@@ -302,6 +372,12 @@ func (c *Config) validate() error {
 	}
 	if c.AlertCooldownMinutes < 0 {
 		return fmt.Errorf("alert_cooldown_minutes must not be negative")
+	}
+	if c.StateDir != "" && !filepath.IsAbs(c.StateDir) {
+		return fmt.Errorf("state_dir must be an absolute path, got %q", c.StateDir)
+	}
+	if c.StateDir != "" && c.History.RetentionDays <= 0 {
+		return fmt.Errorf("history.retention_days must be positive")
 	}
 	if c.Docker.SocketPath == "" {
 		return fmt.Errorf("docker.socket_path must not be empty")
@@ -351,6 +427,15 @@ func (c *Config) validate() error {
 		return fmt.Errorf("host.proc_path must not be empty")
 	}
 
+	if in := c.Incidents; in.Enabled {
+		if in.GroupWaitSeconds < 0 {
+			return fmt.Errorf("incidents.group_wait_seconds must not be negative")
+		}
+		if in.WindowMinutes <= 0 {
+			return fmt.Errorf("incidents.window_minutes must be positive")
+		}
+	}
+
 	for _, p := range c.Redact.Patterns {
 		if _, err := regexp.Compile(p); err != nil {
 			return fmt.Errorf("redact.patterns: %q: %w", p, err)
@@ -394,6 +479,26 @@ func (c *Config) validate() error {
 		if l.MaxPerHour < 0 {
 			return fmt.Errorf("llm.max_per_hour must not be negative")
 		}
+		switch l.Effort {
+		case "low", "medium", "high", "xhigh", "max":
+		default:
+			return fmt.Errorf("llm.effort must be low, medium, high, xhigh or max, got %q", l.Effort)
+		}
+		if l.MaxSteps < 0 || l.MaxSteps > 10 {
+			return fmt.Errorf("llm.max_steps must be between 0 and 10")
+		}
+	}
+
+	if d := c.Digest; d.Enabled {
+		if c.StateDir == "" {
+			return fmt.Errorf("digest needs state_dir: it's built from the alert history")
+		}
+		if _, err := digest.ParseSchedule(d.Every, d.At, d.Weekday); err != nil {
+			return fmt.Errorf("digest: %w", err)
+		}
+	}
+	if tg := c.ChatOps.Telegram; tg.Enabled && tg.Token == "" {
+		return fmt.Errorf("chatops.telegram.token must be set when the bot is enabled")
 	}
 	return nil
 }

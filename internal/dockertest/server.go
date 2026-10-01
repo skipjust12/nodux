@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/skipjust12/nodux/internal/dockerclient"
 )
@@ -26,6 +28,10 @@ type Server struct {
 	logs       map[string][]string
 	stats      map[string]*dockerclient.Stats
 	statsCalls map[string]int
+	top        map[string]*dockerclient.Top
+	df         *dockerclient.DiskUsage
+	// LogQueries gets the raw query of every logs request.
+	LogQueries chan string
 	// Each /events connection gets the next channel from streams; the
 	// stream ends when that channel is closed.
 	streams      chan chan dockerclient.Event
@@ -47,6 +53,8 @@ func New(t *testing.T) *Server {
 		logs:         make(map[string][]string),
 		stats:        make(map[string]*dockerclient.Stats),
 		statsCalls:   make(map[string]int),
+		top:          make(map[string]*dockerclient.Top),
+		LogQueries:   make(chan string, 64),
 		streams:      make(chan chan dockerclient.Event, 16),
 		EventQueries: make(chan string, 16),
 	}
@@ -76,6 +84,20 @@ func (s *Server) SetStats(id string, st *dockerclient.Stats) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stats[id] = st
+}
+
+// SetTop sets what /containers/{id}/top returns.
+func (s *Server) SetTop(id string, top *dockerclient.Top) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.top[id] = top
+}
+
+// SetDiskUsage sets what /system/df returns.
+func (s *Server) SetDiskUsage(df *dockerclient.DiskUsage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.df = df
 }
 
 // StatsCallCount returns how many times stats were fetched for id.
@@ -133,7 +155,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/stats"):
 		s.containerStats(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/stats"))
 	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/logs"):
-		s.containerLogs(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/logs"))
+		select {
+		case s.LogQueries <- r.URL.RawQuery:
+		default:
+		}
+		tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
+		s.containerLogs(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/logs"), tail)
+	case strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/top"):
+		s.containerTop(w, strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/top"))
+	case path == "/system/df":
+		s.mu.Lock()
+		df := s.df
+		s.mu.Unlock()
+		if df == nil {
+			df = &dockerclient.DiskUsage{}
+		}
+		json.NewEncoder(w).Encode(df)
 	default:
 		http.NotFound(w, r)
 	}
@@ -145,7 +182,14 @@ func (s *Server) list(w http.ResponseWriter) {
 	out := []dockerclient.ContainerSummary{}
 	for _, id := range s.order {
 		c := s.containers[id]
-		out = append(out, dockerclient.ContainerSummary{ID: c.ID, Names: []string{c.Name}, State: c.State.Status})
+		var created int64
+		if t, err := time.Parse(time.RFC3339Nano, c.Created); err == nil {
+			created = t.Unix()
+		}
+		out = append(out, dockerclient.ContainerSummary{
+			ID: c.ID, Names: []string{c.Name}, Image: c.Config.Image, ImageID: c.Image, Created: created,
+			State: c.State.Status, Status: c.State.Status, Labels: c.Config.Labels,
+		})
 	}
 	json.NewEncoder(w).Encode(out)
 }
@@ -173,14 +217,32 @@ func (s *Server) containerStats(w http.ResponseWriter, id string) {
 	json.NewEncoder(w).Encode(st)
 }
 
+func (s *Server) containerTop(w http.ResponseWriter, id string) {
+	s.mu.Lock()
+	top, ok := s.top[id]
+	_, exists := s.containers[id]
+	s.mu.Unlock()
+	if !exists {
+		http.Error(w, `{"message":"No such container"}`, http.StatusNotFound)
+		return
+	}
+	if !ok {
+		top = &dockerclient.Top{Titles: []string{"PID", "CMD"}}
+	}
+	json.NewEncoder(w).Encode(top)
+}
+
 // containerLogs writes the multiplexed (non-TTY) log format.
-func (s *Server) containerLogs(w http.ResponseWriter, id string) {
+func (s *Server) containerLogs(w http.ResponseWriter, id string, tail int) {
 	s.mu.Lock()
 	lines, ok := s.logs[id]
 	s.mu.Unlock()
 	if !ok {
 		http.Error(w, `{"message":"No such container"}`, http.StatusNotFound)
 		return
+	}
+	if tail > 0 && len(lines) > tail {
+		lines = lines[len(lines)-tail:]
 	}
 	for _, line := range lines {
 		payload := []byte(line + "\n")

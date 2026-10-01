@@ -1,16 +1,42 @@
-// Package action defines the contract for reacting to detected
-// problems: ConsoleAction (JSON lines on stdout) and WebhookAction
-// (HTTP POST, JSON or Slack-style). New actions plug in without
-// touching the engine.
+// Package action defines the contract for sending what nodux found:
+// ConsoleAction (JSON lines on stdout) and WebhookAction (HTTP POST,
+// JSON or Slack-style). New actions plug in without touching the
+// engine.
 package action
 
 import (
 	"context"
+	"time"
 
 	"github.com/skipjust12/nodux/internal/detector"
 )
 
+// Notification is one message: alerts that belong together (a batch of
+// one incident, or a single alert when grouping is off), or a digest.
+type Notification struct {
+	IncidentID int64
+	// Update is set when this incident was already reported before.
+	Update bool
+	Alerts []detector.Issue
+	// Summary is the LLM layer's note on the batch, if any. It's also
+	// in the Analysis of each firing alert.
+	Summary string
+	// Digest is set (and Alerts empty) for a periodic digest.
+	Digest *Digest
+}
+
+// Digest is the periodic report.
+type Digest struct {
+	Host     string
+	Title    string // "Daily digest"
+	From, To time.Time
+	// Text is the report for people, in Slack mrkdwn.
+	Text string
+	// Data is the same report as structured data, for JSON consumers.
+	Data any
+}
+
 type Action interface {
 	Name() string
-	Run(ctx context.Context, issue detector.Issue) error
+	Send(ctx context.Context, n Notification) error
 }

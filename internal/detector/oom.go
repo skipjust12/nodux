@@ -22,6 +22,7 @@ func (d *OOMDetector) HandleEvent(ev ContainerEvent) *Issue {
 			ID:        ev.ID,
 			Name:      ev.Name,
 			OOMKilled: true,
+			Labels:    ev.Labels,
 		},
 		DetectedAt: ev.Time,
 	}

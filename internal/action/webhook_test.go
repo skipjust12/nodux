@@ -14,6 +14,10 @@ import (
 	"github.com/skipjust12/nodux/internal/detector"
 )
 
+func one(issue detector.Issue) Notification {
+	return Notification{Alerts: []detector.Issue{issue}}
+}
+
 func testIssue() detector.Issue {
 	return detector.Issue{
 		Detector: "oom",
@@ -58,7 +62,7 @@ func TestWebhook_JSONPayloadAndHeaders(t *testing.T) {
 	defer srv.Close()
 
 	w := newWebhook(t, WebhookConfig{URL: srv.URL, Headers: map[string]string{"Authorization": "Bearer s3cret"}})
-	if err := w.Run(context.Background(), testIssue()); err != nil {
+	if err := w.Send(context.Background(), one(testIssue())); err != nil {
 		t.Fatal(err)
 	}
 	closeAndWait(t, w)
@@ -88,7 +92,7 @@ func TestWebhook_SlackFormat(t *testing.T) {
 	defer srv.Close()
 
 	w := newWebhook(t, WebhookConfig{URL: srv.URL, Format: FormatSlack})
-	w.Run(context.Background(), testIssue())
+	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
 
 	var msg map[string]string
@@ -114,7 +118,7 @@ func TestWebhook_RetriesTransientFailures(t *testing.T) {
 	defer srv.Close()
 
 	w := newWebhook(t, WebhookConfig{URL: srv.URL})
-	w.Run(context.Background(), testIssue())
+	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
 	if n := calls.Load(); n != 3 {
 		t.Fatalf("calls = %d, want 3 (two 502s, then success)", n)
@@ -130,7 +134,7 @@ func TestWebhook_DoesNotRetryClientErrors(t *testing.T) {
 	defer srv.Close()
 
 	w := newWebhook(t, WebhookConfig{URL: srv.URL})
-	w.Run(context.Background(), testIssue())
+	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("calls = %d, want 1", n)
@@ -146,7 +150,7 @@ func TestWebhook_GivesUpAfterMaxAttempts(t *testing.T) {
 	defer srv.Close()
 
 	w := newWebhook(t, WebhookConfig{URL: srv.URL})
-	w.Run(context.Background(), testIssue())
+	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
 	if n := calls.Load(); n != webhookAttempts {
 		t.Fatalf("calls = %d, want %d", n, webhookAttempts)
@@ -171,7 +175,7 @@ func TestWebhook_RunNeverBlocksAndCloseAbandonsHungEndpoint(t *testing.T) {
 	start := time.Now()
 	var dropped int
 	for i := 0; i < webhookQueueSize+5; i++ {
-		if err := w.Run(context.Background(), testIssue()); err != nil {
+		if err := w.Send(context.Background(), one(testIssue())); err != nil {
 			dropped++
 		}
 	}
@@ -187,7 +191,7 @@ func TestWebhook_RunNeverBlocksAndCloseAbandonsHungEndpoint(t *testing.T) {
 	if err := w.Close(ctx); err == nil {
 		t.Fatal("expected Close to report abandoned alerts")
 	}
-	if err := w.Run(context.Background(), testIssue()); err == nil {
+	if err := w.Send(context.Background(), one(testIssue())); err == nil {
 		t.Fatal("Run after Close should fail")
 	}
 }
@@ -211,7 +215,7 @@ func TestSlackText_ResolvedHostAndAnalysis(t *testing.T) {
 	issue := testIssue()
 	issue.Host = "vps1"
 	issue.Analysis = "Heap grows without bound.\nCheck the cache size."
-	text := slackText(issue)
+	text := slackText(issue, "")
 	if !strings.HasPrefix(text, "*[CRITICAL] oom* `api` on vps1: ") {
 		t.Errorf("text = %q", text)
 	}
@@ -220,7 +224,7 @@ func TestSlackText_ResolvedHostAndAnalysis(t *testing.T) {
 	}
 
 	resolved := detector.Issue{Detector: "host_disk", Severity: detector.SeverityCritical, Resource: "/", Message: "resolved after 5m0s (was: disk / at 95%)", Resolved: true}
-	if got := slackText(resolved); got != "*[RESOLVED] host_disk* `/`: resolved after 5m0s (was: disk / at 95%)" {
+	if got := slackText(resolved, ""); got != "*[RESOLVED] host_disk* `/`: resolved after 5m0s (was: disk / at 95%)" {
 		t.Errorf("resolved text = %q", got)
 	}
 }
@@ -232,7 +236,7 @@ func TestSlackText_FitsDiscordAndEscapesFences(t *testing.T) {
 		strings.Repeat("a", 5000), strings.Repeat("b", 400), strings.Repeat("c", 400),
 		"```rm -rf```", strings.Repeat("d", 400),
 	}
-	text := slackText(issue)
+	text := slackText(issue, "")
 	if len(text) > slackMaxMessage {
 		t.Fatalf("text is %d bytes, over %d", len(text), slackMaxMessage)
 	}

@@ -20,6 +20,20 @@ poll_interval_seconds: 15
 # over, so they don't need a cooldown.
 alert_cooldown_minutes: 10
 
+# Where nodux keeps what has to survive a restart: open alerts, detector
+# state and the event stream position (state.json), and the alert
+# history (history.db, SQLite). With it, a restart doesn't re-send what's
+# still broken, resolves what got fixed meanwhile, and replays the
+# Docker events it missed. The digest and the LLM layer's "earlier
+# alerts" read the history. Must be writable; "" keeps everything in
+# memory (and turns the digest off).
+state_dir: /var/lib/nodux
+
+history:
+  # Alerts and LLM usage older than this are deleted. Memory samples
+  # (for the digest) are kept two weeks at most.
+  retention_days: 30
+
 docker:
   # Docker on Linux:
   socket_path: /var/run/docker.sock
@@ -29,9 +43,22 @@ docker:
   # Alert when the daemon has been unreachable this long. 0 disables it.
   down_alert_after_seconds: 60
 
-# Container names that are never checked.
+# Container names that are never checked (the LLM layer can't see them
+# either).
 exclude_containers: []
   # - some-noisy-container
+
+# Containers can also be tuned with labels, e.g. in a compose file:
+#
+#   nodux.enable=false             never check this container
+#   nodux.expected=true            it must be running (see expected below)
+#   nodux.<detector>.enable=false  turn one detector off for it
+#                                  (crashloop, unhealthy, oom, exit, memory)
+#   nodux.memory.threshold=80      percent of its memory limit
+#   nodux.memory.for=2m            ...for this long
+#   nodux.crashloop.threshold=5    restarts...
+#   nodux.crashloop.window=10m     ...within this window
+#   nodux.exit.ignore=0,143        exit codes that aren't a crash
 
 detectors:
   # A container was restarted after a crash restart_threshold times
@@ -72,7 +99,9 @@ detectors:
   # These containers must be running. Catches what nothing else does: a
   # container that exited with code 0, or wasn't started after a reboot.
   # A container has to be down for grace_seconds before it's reported,
-  # so a compose recreate doesn't trigger it.
+  # so a compose recreate doesn't trigger it. Containers labeled
+  # nodux.expected=true count too, for as long as they exist; the ones
+  # listed here must also exist.
   expected:
     enabled: true
     containers: []
@@ -105,6 +134,19 @@ host:
     enabled: true
     threshold_percent: 95
     for_seconds: 600
+
+# Related alerts go out as one message per incident instead of one
+# each: alerts about the same container or the same compose project,
+# and anything that fails while a host-level alert (disk, memory, CPU,
+# the Docker daemon) is open. With the LLM layer on, an incident gets
+# one analysis.
+incidents:
+  enabled: true
+  # Alerts are held this long to collect related ones. 0 sends right
+  # away (later alerts of the incident go out as updates).
+  group_wait_seconds: 30
+  # An incident takes new alerts while its last one is this recent.
+  window_minutes: 10
 
 # Alert messages and logs are scrubbed before they go to a webhook or
 # the LLM. defaults covers password=..., bearer tokens, credentials in
@@ -139,12 +181,48 @@ heartbeat:
   url: https://hc-ping.com/${NODUX_HEARTBEAT_UUID}
   interval_seconds: 60
 
-# Optional: have Claude read container alerts and their (redacted) logs
-# and add a short probable-cause note. Detection doesn't depend on it.
+# Optional: have Claude read each incident (alerts, redacted logs, how
+# long the container ran, its image and whether it just changed, its
+# earlier alerts) and add a short probable-cause note. It can look
+# further with read-only tools (container details, logs around the
+# failure, live stats and processes, docker system df, a host overview,
+# alert history); it can't change anything. Also answers the chat bot
+# and writes the digest's takeaway. Detection doesn't depend on it.
 llm:
   enabled: false
   api_key: ${ANTHROPIC_API_KEY}
   model: claude-opus-5-5
-  timeout_seconds: 30
-  # Alerts over the cap go out without an analysis. 0 = no cap.
+  # low, medium, high, xhigh or max.
+  effort: low
+  # Rounds of tool calls per analysis; 0 = no tools, one request.
+  max_steps: 4
+  # For a whole analysis, tool calls included.
+  timeout_seconds: 90
+  # Analyses, answers and digest notes per hour; alerts over the cap go
+  # out without an analysis. 0 = no cap.
   max_per_hour: 30
+
+# A periodic report through the same actions: what broke and how often,
+# what flaps, what's still open, whose memory keeps growing, and what
+# the LLM layer cost. Needs state_dir. Preview it any time with
+# nodux --config ... -digest.
+digest:
+  enabled: false
+  # daily or weekly.
+  every: daily
+  # Local time of the host (set TZ in a container).
+  at: "09:00"
+  # For weekly.
+  weekday: monday
+
+# Ask about the host from Telegram: "what's wrong with api?" is answered
+# by the LLM layer with the same read-only tools; /status and /alerts
+# work without it. The bot polls Telegram, so nothing listens on the
+# host. It only answers the chats listed here: write to it once and the
+# log tells you your chat ID.
+chatops:
+  telegram:
+    enabled: false
+    token: ${NODUX_TELEGRAM_TOKEN}
+    allowed_chat_ids: []
+      # - 123456789

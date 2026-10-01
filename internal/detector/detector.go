@@ -44,6 +44,19 @@ type ContainerSnapshot struct {
 	// limit, and only when a detector needs it. Limit 0 = not collected.
 	MemoryUsed  uint64
 	MemoryLimit uint64
+
+	// Configuration, from inspect. Empty for issues built from event
+	// data alone (a container already removed with --rm).
+	Image         string    // as given to docker run: "nginx:1.27"
+	ImageID       string    // sha256:...
+	Created       time.Time // a recent Created usually means a deploy
+	RestartPolicy string    // "always", "on-failure:5", "no", ...
+	MemoryMax     uint64    // the -m limit, 0 = none
+	Labels        map[string]string
+
+	// LastRun is how long the container's last run lasted before it
+	// exited, when the event stream told us. 0 = unknown.
+	LastRun time.Duration
 }
 
 // ContainerEvent is a container lifecycle event from the daemon.
@@ -58,6 +71,9 @@ type ContainerEvent struct {
 	// stop sends first), 0 if unknown. Only filled in for "kill".
 	StopSignal int
 	Time       time.Time
+	// Labels are the container's nodux.* and com.docker.compose.*
+	// labels, which the daemon includes in event attributes.
+	Labels map[string]string
 }
 
 // Issue is a detected problem, or the resolution of one. Logs is
@@ -80,6 +96,12 @@ type Issue struct {
 	// Resolved marks the "problem is over" notification that follows a
 	// level-triggered alert.
 	Resolved bool
+	// Key identifies the episode a level-triggered alert and its
+	// resolution belong to (set by the engine). Empty for one-off alerts.
+	Key string
+	// IncidentID groups alerts that are likely about the same problem
+	// (set when they're dispatched). 0 = not grouped.
+	IncidentID int64
 }
 
 const (
@@ -121,6 +143,21 @@ type HostDetector interface {
 // can drop state for containers that no longer exist.
 type Forgetter interface {
 	Forget(containerID string)
+}
+
+// Stateful is implemented by detectors whose state has to survive a
+// restart of nodux: half-counted crash loops, thresholds that are
+// already firing (they only resolve after dropping below the
+// hysteresis gap), containers already down for part of their grace
+// period. Without it a restart would resolve and re-fire what's still
+// broken.
+//
+// The engine calls SaveState from the poll loop while the event loop is
+// paused, and LoadState before either loop starts.
+type Stateful interface {
+	Name() string
+	SaveState() ([]byte, error)
+	LoadState(data []byte) error
 }
 
 // EventActions are the event types event detectors are fed.

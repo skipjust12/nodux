@@ -20,6 +20,8 @@ var DefaultPatterns = []string{
 	// key=value / key: value / "key": "value"
 	`(?i)\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth)["']?\s*[:=]\s*["']?(?P<secret>[^\s"',;&]+)`,
 	`(?i)\bbearer\s+(?P<secret>[A-Za-z0-9._~+/=-]{8,})`,
+	// Command-line flags with the value after a space: --token abc
+	`(?i)(?:^|\s)--?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth)\s+(?P<secret>[^\s-]\S*)`,
 	// Credentials embedded in a URL: scheme://user:secret@host
 	`://[^/\s:@]+:(?P<secret>[^@\s/]+)@`,
 	// AWS access key IDs, GitHub/Slack/Anthropic-style tokens.

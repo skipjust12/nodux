@@ -1,8 +1,8 @@
 // Package dockerclient is a minimal Docker Engine API client over a
-// unix socket. It only implements what nodux needs: listing containers,
-// inspecting them, fetching a tail of logs, and following the event
-// stream. Works with both Docker
-// and Podman, since both expose a Docker-compatible REST API on a socket.
+// unix socket. It only implements what nodux needs, all of it read-only:
+// listing and inspecting containers, stats, processes, logs, disk usage
+// and the event stream. Works with both Docker and Podman, since both
+// expose a Docker-compatible REST API on a socket.
 package dockerclient
 
 import (
@@ -118,7 +118,7 @@ func (c *Client) ListContainers(ctx context.Context) ([]ContainerSummary, error)
 
 // InspectContainer returns detailed state for a single container.
 func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerInspect, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/containers/"+id+"/json")
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/json")
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +135,18 @@ func (c *Client) InspectContainer(ctx context.Context, id string) (*ContainerIns
 // daemon's wait for a second sample (only needed for CPU percentages),
 // which makes this a ~30ms call instead of ~1-2s.
 func (c *Client) ContainerStats(ctx context.Context, id string) (*Stats, error) {
-	resp, err := c.do(ctx, http.MethodGet, "/containers/"+id+"/stats?stream=false&one-shot=true")
+	return c.stats(ctx, id, "stream=false&one-shot=true")
+}
+
+// ContainerStatsSampled returns stats with a previous sample to compare
+// with, so CPUPercent works. The daemon waits for that second sample,
+// which takes a second or two.
+func (c *Client) ContainerStatsSampled(ctx context.Context, id string) (*Stats, error) {
+	return c.stats(ctx, id, "stream=false")
+}
+
+func (c *Client) stats(ctx context.Context, id, query string) (*Stats, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/stats?"+query)
 	if err != nil {
 		return nil, err
 	}
@@ -151,8 +162,37 @@ func (c *Client) ContainerStats(ctx context.Context, id string) (*Stats, error) 
 // ContainerLogs returns up to tail of the last non-empty log lines
 // (stdout+stderr interleaved, in the order the daemon emits them).
 func (c *Client) ContainerLogs(ctx context.Context, id string, tail int, tty bool) ([]string, error) {
-	path := fmt.Sprintf("/containers/%s/logs?stdout=true&stderr=true&tail=%d", id, tail)
-	resp, err := c.do(ctx, http.MethodGet, path)
+	return c.ContainerLogsRange(ctx, id, LogOptions{Tail: tail, TTY: tty})
+}
+
+// LogOptions narrows a log fetch. Zero values mean no limit.
+type LogOptions struct {
+	Since, Until time.Time
+	Tail         int
+	TTY          bool // the container has a TTY: logs aren't multiplexed
+	// Timestamps prefixes each line with the time the daemon logged it
+	// (RFC 3339, nanoseconds).
+	Timestamps bool
+}
+
+// ContainerLogsRange returns the non-empty log lines between Since and
+// Until, at most the last Tail of them.
+func (c *Client) ContainerLogsRange(ctx context.Context, id string, opts LogOptions) ([]string, error) {
+	q := url.Values{"stdout": {"true"}, "stderr": {"true"}}
+	if opts.Tail > 0 {
+		q.Set("tail", strconv.Itoa(opts.Tail))
+	}
+	if !opts.Since.IsZero() {
+		q.Set("since", unixTime(opts.Since))
+	}
+	if !opts.Until.IsZero() {
+		q.Set("until", unixTime(opts.Until))
+	}
+	if opts.Timestamps {
+		q.Set("timestamps", "true")
+	}
+	tty := opts.TTY
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/logs?"+q.Encode())
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +237,7 @@ func (c *Client) Events(ctx context.Context, since time.Time, actions []string, 
 	}
 	q := url.Values{"filters": {string(filters)}}
 	if !since.IsZero() {
-		q.Set("since", strconv.FormatInt(since.Unix(), 10)+"."+fmt.Sprintf("%09d", since.Nanosecond()))
+		q.Set("since", unixTime(since))
 	}
 
 	resp, err := c.doWith(ctx, c.stream, http.MethodGet, "/events?"+q.Encode())
@@ -220,6 +260,46 @@ func (c *Client) Events(ctx context.Context, since time.Time, actions []string, 
 		}
 		fn(ev)
 	}
+}
+
+// ContainerTop lists the processes running in a container.
+func (c *Client) ContainerTop(ctx context.Context, id string) (*Top, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(id)+"/top")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var out Top
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode container top %s: %w", id, err)
+	}
+	return &out, nil
+}
+
+// DiskUsage is docker system df: what images, containers, volumes and
+// the build cache take up. It can take a while on a big host, since the
+// daemon walks volume directories.
+func (c *Client) DiskUsage(ctx context.Context) (*DiskUsage, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	resp, err := c.doWith(ctx, c.stream, http.MethodGet, "/system/df")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var out DiskUsage
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode system df: %w", err)
+	}
+	return &out, nil
+}
+
+// unixTime formats t the way the API takes since/until: seconds with a
+// nanosecond fraction.
+func unixTime(t time.Time) string {
+	return strconv.FormatInt(t.Unix(), 10) + "." + fmt.Sprintf("%09d", t.Nanosecond())
 }
 
 // demuxLogs parses Docker's multiplexed log stream format: each frame

@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/redact"
 )
 
@@ -35,9 +34,11 @@ type WebhookConfig struct {
 	Timeout time.Duration
 }
 
-// WebhookAction POSTs each alert to an HTTP endpoint. Delivery happens
-// on a background worker so a slow or dead endpoint never stalls the
-// detection loops; Run only enqueues. Failed deliveries are retried on
+// WebhookAction POSTs alerts to an HTTP endpoint. In json format each
+// alert is its own POST (the Record, as on the console); in slack
+// format each notification is one message. Delivery happens on a
+// background worker so a slow or dead endpoint never stalls the
+// detection loops; Send only enqueues. Failed deliveries are retried on
 // network errors, 5xx and 429, with backoff.
 type WebhookAction struct {
 	cfg     WebhookConfig
@@ -46,7 +47,7 @@ type WebhookAction struct {
 
 	mu     sync.RWMutex // guards closed and the send on queue
 	closed bool
-	queue  chan detector.Issue
+	queue  chan Notification
 
 	ctx    context.Context // cancelled if Close gives up draining
 	cancel context.CancelFunc
@@ -65,7 +66,7 @@ func NewWebhook(cfg WebhookConfig) *WebhookAction {
 		cfg:     cfg,
 		client:  &http.Client{Timeout: cfg.Timeout},
 		backoff: time.Second,
-		queue:   make(chan detector.Issue, webhookQueueSize),
+		queue:   make(chan Notification, webhookQueueSize),
 		ctx:     ctx,
 		cancel:  cancel,
 		done:    make(chan struct{}),
@@ -76,17 +77,17 @@ func NewWebhook(cfg WebhookConfig) *WebhookAction {
 
 func (w *WebhookAction) Name() string { return "webhook" }
 
-func (w *WebhookAction) Run(_ context.Context, issue detector.Issue) error {
+func (w *WebhookAction) Send(_ context.Context, n Notification) error {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if w.closed {
 		return errors.New("webhook action is closed")
 	}
 	select {
-	case w.queue <- issue:
+	case w.queue <- n:
 		return nil
 	default:
-		return fmt.Errorf("webhook queue full (%d pending), dropping alert", webhookQueueSize)
+		return fmt.Errorf("webhook queue full (%d pending), dropping notification", webhookQueueSize)
 	}
 }
 
@@ -112,19 +113,21 @@ func (w *WebhookAction) Close(ctx context.Context) error {
 
 func (w *WebhookAction) worker() {
 	defer close(w.done)
-	for issue := range w.queue {
-		if err := w.deliver(issue); err != nil {
-			slog.Error("webhook delivery failed", "url", redact.URL(w.cfg.URL), "detector", issue.Detector, "container", issue.Container.Name, "error", err)
+	for n := range w.queue {
+		bodies, err := w.payloads(n)
+		if err != nil {
+			slog.Error("webhook payload", "error", err)
+			continue
+		}
+		for _, body := range bodies {
+			if err := w.deliver(body); err != nil {
+				slog.Error("webhook delivery failed", "url", redact.URL(w.cfg.URL), "incident", n.IncidentID, "error", err)
+			}
 		}
 	}
 }
 
-func (w *WebhookAction) deliver(issue detector.Issue) error {
-	body, err := w.payload(issue)
-	if err != nil {
-		return err
-	}
-
+func (w *WebhookAction) deliver(body []byte) error {
 	delay := w.backoff
 	for attempt := 1; ; attempt++ {
 		retry, err := w.post(body)
@@ -171,9 +174,27 @@ func (w *WebhookAction) post(body []byte) (retry bool, err error) {
 	return resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests, err
 }
 
-func (w *WebhookAction) payload(issue detector.Issue) ([]byte, error) {
+// payloads is what to POST for a notification: one Slack message, or
+// one JSON record per alert (or the digest record).
+func (w *WebhookAction) payloads(n Notification) ([][]byte, error) {
 	if w.cfg.Format == FormatSlack {
-		return json.Marshal(map[string]string{"text": slackText(issue)})
+		b, err := json.Marshal(map[string]string{"text": slackNotification(n)})
+		return [][]byte{b}, err
 	}
-	return json.Marshal(NewRecord(issue))
+	var out [][]byte
+	if n.Digest != nil {
+		b, err := json.Marshal(NewDigestRecord(n.Digest))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	for _, issue := range n.Alerts {
+		b, err := json.Marshal(NewRecord(issue))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }
