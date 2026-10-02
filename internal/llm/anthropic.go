@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -76,6 +77,37 @@ type Anthropic struct {
 	maxPerHour int
 	calls      []time.Time
 	now        func() time.Time
+
+	ok, failed, overBudget atomic.Uint64
+}
+
+// Budget describes the hourly budget and how requests went so far.
+type Budget struct {
+	// MaxPerHour is the hourly cap, 0 = none; Remaining is what's left
+	// of it right now.
+	MaxPerHour int `json:"max_per_hour"`
+	Remaining  int `json:"remaining"`
+	// Analyses, answers and digest notes since startup.
+	OK         uint64 `json:"ok"`
+	Failed     uint64 `json:"failed"`
+	OverBudget uint64 `json:"over_budget"`
+}
+
+func (a *Anthropic) Budget() Budget {
+	a.mu.Lock()
+	a.pruneLocked()
+	used := len(a.calls)
+	a.mu.Unlock()
+	b := Budget{
+		MaxPerHour: a.maxPerHour,
+		OK:         a.ok.Load(),
+		Failed:     a.failed.Load(),
+		OverBudget: a.overBudget.Load(),
+	}
+	if a.maxPerHour > 0 {
+		b.Remaining = max(a.maxPerHour-used, 0)
+	}
+	return b
 }
 
 func NewAnthropic(cfg AnthropicConfig) *Anthropic {
@@ -169,14 +201,26 @@ type request struct {
 	maxChars int
 }
 
-// run sends one request, and keeps going while the model asks for
+// run applies the hourly budget and counts how the request went.
+func (a *Anthropic) run(ctx context.Context, r request) (string, error) {
+	if !a.allow() {
+		a.overBudget.Add(1)
+		return "", ErrBudgetExhausted
+	}
+	text, err := a.converse(ctx, r)
+	if err != nil {
+		a.failed.Add(1)
+	} else {
+		a.ok.Add(1)
+	}
+	return text, err
+}
+
+// converse sends one request, and keeps going while the model asks for
 // tools, up to maxSteps rounds of them. The conversation only ever
 // grows by appending, so the prompt cache and thinking blocks stay
 // valid from one step to the next.
-func (a *Anthropic) run(ctx context.Context, r request) (string, error) {
-	if !a.allow() {
-		return "", ErrBudgetExhausted
-	}
+func (a *Anthropic) converse(ctx context.Context, r request) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, a.timeout)
 	defer cancel()
 
@@ -306,8 +350,16 @@ func (a *Anthropic) allow() bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	now := a.now()
-	cutoff := now.Add(-time.Hour)
+	a.pruneLocked()
+	if len(a.calls) >= a.maxPerHour {
+		return false
+	}
+	a.calls = append(a.calls, a.now())
+	return true
+}
+
+func (a *Anthropic) pruneLocked() {
+	cutoff := a.now().Add(-time.Hour)
 	kept := a.calls[:0]
 	for _, t := range a.calls {
 		if t.After(cutoff) {
@@ -315,9 +367,4 @@ func (a *Anthropic) allow() bool {
 		}
 	}
 	a.calls = kept
-	if len(a.calls) >= a.maxPerHour {
-		return false
-	}
-	a.calls = append(a.calls, now)
-	return true
 }

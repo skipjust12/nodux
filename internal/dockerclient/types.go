@@ -30,8 +30,10 @@ type ContainerInspect struct {
 		Entrypoint []string          `json:"Entrypoint"`
 	} `json:"Config"`
 	HostConfig struct {
-		Memory        int64 `json:"Memory"` // memory limit in bytes, 0 = unlimited
-		NanoCpus      int64 `json:"NanoCpus"`
+		Memory        int64 `json:"Memory"`    // memory limit in bytes, 0 = unlimited
+		NanoCpus      int64 `json:"NanoCpus"`  // --cpus, in 1e-9 CPUs
+		CPUQuota      int64 `json:"CpuQuota"`  // --cpu-quota, µs per period
+		CPUPeriod     int64 `json:"CpuPeriod"` // --cpu-period, µs; 0 = 100ms
 		RestartPolicy struct {
 			Name              string `json:"Name"`
 			MaximumRetryCount int    `json:"MaximumRetryCount"`
@@ -82,6 +84,22 @@ type Event struct {
 type Actor struct {
 	ID         string            `json:"ID"`
 	Attributes map[string]string `json:"Attributes"`
+}
+
+// CPULimit is the container's CPU limit in CPUs, 0 if it has none.
+func (c *ContainerInspect) CPULimit() float64 {
+	h := c.HostConfig
+	if h.NanoCpus > 0 {
+		return float64(h.NanoCpus) / 1e9
+	}
+	if h.CPUQuota > 0 {
+		period := h.CPUPeriod
+		if period <= 0 {
+			period = 100000
+		}
+		return float64(h.CPUQuota) / float64(period)
+	}
+	return 0
 }
 
 // Stats is the GET /containers/{id}/stats response.

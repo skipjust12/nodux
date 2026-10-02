@@ -30,6 +30,7 @@ type savedState struct {
 	Images    map[string]*imageInfo      `json:"images,omitempty"`
 	Detectors map[string]json.RawMessage `json:"detectors,omitempty"`
 	Incidents json.RawMessage            `json:"incidents,omitempty"`
+	Silences  json.RawMessage            `json:"silences,omitempty"`
 }
 
 type savedEvents struct {
@@ -42,6 +43,8 @@ type savedEpisode struct {
 	Since       time.Time      `json:"since"`
 	ContainerID string         `json:"container_id,omitempty"`
 	Issue       detector.Issue `json:"issue"`
+	// Held: the alert is still held back by a silence.
+	Held bool `json:"held,omitempty"`
 }
 
 // saveState writes the state file. It runs on the poll loop (whose
@@ -67,7 +70,7 @@ func (e *Engine) saveState() {
 	for key, a := range e.active {
 		issue := a.issue
 		issue.Logs = nil
-		st.Episodes = append(st.Episodes, savedEpisode{Key: key, Since: a.since, ContainerID: a.containerID, Issue: issue})
+		st.Episodes = append(st.Episodes, savedEpisode{Key: key, Since: a.since, ContainerID: a.containerID, Issue: issue, Held: !a.notified})
 	}
 	if len(e.lastAlert) > 0 {
 		st.Cooldowns = make(map[string]time.Time, len(e.lastAlert))
@@ -96,6 +99,11 @@ func (e *Engine) saveState() {
 	}
 	if raw, err := e.grouper.SaveState(); err == nil {
 		st.Incidents = raw
+	}
+	if e.opts.Silences != nil {
+		if raw, err := e.opts.Silences.SaveState(); err == nil {
+			st.Silences = raw
+		}
 	}
 
 	if err := e.opts.State.Save(st); err != nil {
@@ -146,7 +154,7 @@ func (e *Engine) restore() {
 			continue // excluded since: it's never checked again
 		}
 		ep.Issue.Key = ep.Key
-		e.active[ep.Key] = &activeAlert{issue: ep.Issue, since: ep.Since, containerID: ep.ContainerID}
+		e.active[ep.Key] = &activeAlert{issue: ep.Issue, since: ep.Since, containerID: ep.ContainerID, notified: !ep.Held}
 		if ep.ContainerID != "" {
 			// The first poll resolves episodes of containers removed while
 			// nodux was down, as if it had seen them disappear.
@@ -176,6 +184,11 @@ func (e *Engine) restore() {
 			slog.Warn("ignoring saved incident state", "error", err)
 		}
 	}
+	if len(st.Silences) > 0 && e.opts.Silences != nil {
+		if err := e.opts.Silences.LoadState(st.Silences); err != nil {
+			slog.Warn("ignoring saved silences", "error", err)
+		}
+	}
 
 	since := st.Events.Since
 	switch {
@@ -202,6 +215,9 @@ func (e *Engine) knownDetectors() map[string]bool {
 		known[name] = true
 	}
 	for _, d := range e.opts.HostDetectors {
+		known[d.Name()] = true
+	}
+	for _, d := range e.opts.Probes {
 		known[d.Name()] = true
 	}
 	if e.opts.Expected != nil {

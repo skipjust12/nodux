@@ -45,12 +45,12 @@ func ParseSignal(s string) int {
 	return 0
 }
 
-// isStopRequest reports whether a "kill" event is someone stopping the
+// IsStopRequest reports whether a "kill" event is someone stopping the
 // container, as opposed to poking it with a signal it's expected to
 // survive (docker kill -s HUP to reload nginx, USR1 to reopen logs).
 // docker stop / restart / rm -f / compose down send the container's
 // stop signal and then SIGKILL; docker kill defaults to SIGKILL.
-func isStopRequest(ev ContainerEvent) bool {
+func IsStopRequest(ev ContainerEvent) bool {
 	switch ev.Signal {
 	case 0:
 		return true // unknown: assume a stop rather than risk a false crash alert
@@ -70,7 +70,7 @@ func (t stopTracker) observe(ev ContainerEvent) {
 	case "start", "destroy":
 		delete(t, ev.ID)
 	case "kill":
-		if isStopRequest(ev) {
+		if IsStopRequest(ev) {
 			t[ev.ID] = true
 		}
 	}

@@ -153,3 +153,36 @@ func subject(issue detector.Issue) string {
 func escapeCode(s string) string {
 	return strings.ReplaceAll(s, "```", "`​`​`")
 }
+
+// headline is "[CRITICAL] crashloop", or "[RESOLVED] crashloop".
+func headline(issue detector.Issue) string {
+	label := strings.ToUpper(issue.Severity)
+	if issue.Resolved {
+		label = "RESOLVED"
+	}
+	return fmt.Sprintf("[%s] %s", label, issue.Detector)
+}
+
+// lastLines returns up to n of the newest log lines, each cut to max
+// bytes, in a fresh slice.
+func lastLines(logs []string, n, max int) []string {
+	if len(logs) > n {
+		logs = logs[len(logs)-n:]
+	}
+	out := make([]string, len(logs))
+	for i, l := range logs {
+		out[i] = detector.Truncate(l, max)
+	}
+	return out
+}
+
+// firstLogs is the logs of the first firing alert that has any: what a
+// batch message shows.
+func firstLogs(alerts []detector.Issue) []string {
+	for _, a := range alerts {
+		if !a.Resolved && len(a.Logs) > 0 {
+			return a.Logs
+		}
+	}
+	return nil
+}

@@ -12,8 +12,15 @@ const maxHealthOutput = 300
 // "unhealthy". The episode ends when Docker reports it healthy (or
 // starting, after a restart) again.
 //
-// Unlike crashloop, an already-unhealthy container is reported on first
-// sight: it's an ongoing state, not a past event, so it's still actionable.
+// Like crashloop, it's both an EventDetector and a poll Detector. The
+// daemon emits "health_status: unhealthy" the moment the status flips,
+// so the alert doesn't wait for the next poll; the poll keeps the
+// episode open and closes it. The event carries no healthcheck output,
+// so the engine inspects the container and asks Confirm for the actual
+// issue.
+//
+// An already-unhealthy container is reported on first sight: it's an
+// ongoing state, not a past event, so it's still actionable.
 //
 // Only running containers count: Docker marks a container with a
 // healthcheck unhealthy when it stops, including on a plain docker stop.
@@ -30,7 +37,10 @@ func (d *UnhealthyDetector) Check(s ContainerSnapshot) *Issue {
 		return nil
 	}
 
-	msg := fmt.Sprintf("healthcheck failing (%d consecutive failures)", s.HealthFailingStreak)
+	msg := "healthcheck failing"
+	if s.HealthFailingStreak > 0 {
+		msg += fmt.Sprintf(" (%d consecutive failures)", s.HealthFailingStreak)
+	}
 	if out := Truncate(strings.TrimSpace(s.HealthLastOutput), maxHealthOutput); out != "" {
 		msg += ": " + out
 	}
@@ -42,4 +52,26 @@ func (d *UnhealthyDetector) Check(s ContainerSnapshot) *Issue {
 		Container:  s,
 		DetectedAt: time.Now(),
 	}
+}
+
+// HandleEvent opens the episode on "health_status: unhealthy". The
+// container is assumed running (the daemon doesn't run healthchecks on
+// stopped containers); Confirm checks that against inspect.
+func (d *UnhealthyDetector) HandleEvent(ev ContainerEvent) *Issue {
+	if ev.Action != "health_status" || ev.HealthStatus != "unhealthy" {
+		return nil
+	}
+	return d.Check(ContainerSnapshot{
+		ID:           ev.ID,
+		Name:         ev.Name,
+		Labels:       ev.Labels,
+		Status:       "running",
+		HealthStatus: "unhealthy",
+	})
+}
+
+// Confirm rebuilds the issue from the inspected container, which has the
+// failing streak and the last check's output.
+func (d *UnhealthyDetector) Confirm(s ContainerSnapshot) *Issue {
+	return d.Check(s)
 }

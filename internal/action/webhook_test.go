@@ -36,7 +36,7 @@ type captured struct {
 	body   []byte
 }
 
-func newWebhook(t *testing.T, cfg WebhookConfig) *WebhookAction {
+func newWebhook(t *testing.T, cfg WebhookConfig) *HTTPAction {
 	t.Helper()
 	w := NewWebhook(cfg)
 	w.backoff = time.Millisecond
@@ -44,7 +44,7 @@ func newWebhook(t *testing.T, cfg WebhookConfig) *WebhookAction {
 	return w
 }
 
-func closeAndWait(t *testing.T, w *WebhookAction) {
+func closeAndWait(t *testing.T, w *HTTPAction) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -152,8 +152,8 @@ func TestWebhook_GivesUpAfterMaxAttempts(t *testing.T) {
 	w := newWebhook(t, WebhookConfig{URL: srv.URL})
 	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
-	if n := calls.Load(); n != webhookAttempts {
-		t.Fatalf("calls = %d, want %d", n, webhookAttempts)
+	if n := calls.Load(); n != httpAttempts {
+		t.Fatalf("calls = %d, want %d", n, httpAttempts)
 	}
 }
 
@@ -174,7 +174,7 @@ func TestWebhook_RunNeverBlocksAndCloseAbandonsHungEndpoint(t *testing.T) {
 	// never block the detection loops.
 	start := time.Now()
 	var dropped int
-	for i := 0; i < webhookQueueSize+5; i++ {
+	for i := 0; i < httpQueueSize+5; i++ {
 		if err := w.Send(context.Background(), one(testIssue())); err != nil {
 			dropped++
 		}

@@ -130,6 +130,28 @@ func TestLoad_Errors(t *testing.T) {
 		"webhook bad format":     "actions:\n  webhook:\n    enabled: true\n    url: https://x\n    format: teams\n",
 		"heartbeat without url":  "heartbeat:\n  enabled: true\n",
 		"llm without key":        "llm:\n  enabled: true\n  api_key: ''\n",
+		"throttle threshold 0":   "detectors:\n  cpu_throttle:\n    threshold_percent: 0\n",
+		"forecast window 0":      "host:\n  disk:\n    forecast:\n      window_minutes: 0\n",
+		"forecast without paths": "host:\n  disk:\n    enabled: false\n    paths: []\n",
+		"pressure over 100":      "host:\n  pressure:\n    io_full_percent: 101\n",
+		"probe without name":     "probes:\n  targets:\n    - url: https://x\n",
+		"probe two kinds":        "probes:\n  targets:\n    - {name: a, url: 'https://x', tcp: 'x:1'}\n",
+		"probe bad tcp":          "probes:\n  targets:\n    - {name: a, tcp: 'nohost'}\n",
+		"probe bad url":          "probes:\n  targets:\n    - {name: a, url: 'x.com'}\n",
+		"probe duplicate":        "probes:\n  targets:\n    - {name: a, tcp: 'x:1'}\n    - {name: a, tcp: 'x:2'}\n",
+		"probe status on tcp":    "probes:\n  targets:\n    - {name: a, tcp: 'x:1', status: [200]}\n",
+		"probe bad status":       "probes:\n  targets:\n    - {name: a, url: 'https://x', status: [42]}\n",
+		"cert critical > warn":   "probes:\n  cert_warn_days: 3\n  cert_critical_days: 7\n  targets:\n    - {name: a, tls: 'x:443'}\n",
+		"receiver without name":  "actions:\n  receivers:\n    - {type: ntfy, url: 'https://ntfy.sh/t'}\n",
+		"receiver bad type":      "actions:\n  receivers:\n    - {name: a, type: teams, url: 'https://x'}\n",
+		"receiver bad severity":  "actions:\n  receivers:\n    - {name: a, type: ntfy, url: 'https://ntfy.sh/t', severities: [info]}\n",
+		"telegram without chat":  "actions:\n  receivers:\n    - {name: a, type: telegram, bot_token: x}\n",
+		"ntfy without topic":     "actions:\n  receivers:\n    - {name: a, type: ntfy, url: 'https://ntfy.sh/'}\n",
+		"foreign field":          "actions:\n  receivers:\n    - {name: a, type: ntfy, url: 'https://ntfy.sh/t', chat_id: '1'}\n",
+		"duplicate receiver":     "actions:\n  receivers:\n    - {name: a, type: ntfy, url: 'https://ntfy.sh/t'}\n    - {name: a, type: ntfy, url: 'https://ntfy.sh/u'}\n",
+		"receiver named webhook": "actions:\n  webhook: {enabled: true, url: 'https://x'}\n  receivers:\n    - {name: webhook, type: ntfy, url: 'https://ntfy.sh/t'}\n",
+		"negative deploy grace":  "silences:\n  deploy_grace_seconds: -1\n",
+		"bad listen":             "server:\n  listen: 9321\n",
 		"llm bad effort":         "llm:\n  enabled: true\n  api_key: k\n  effort: extreme\n",
 		"llm too many steps":     "llm:\n  enabled: true\n  api_key: k\n  max_steps: 50\n",
 		"relative state_dir":     "state_dir: state\n",
@@ -232,5 +254,66 @@ func TestLoad_InvalidURLErrorDoesNotEchoSecrets(t *testing.T) {
 	_, err := Load(write(t, "actions:\n  webhook:\n    enabled: true\n    url: hooks.slack.com/services/T0/B0/SECRET\n"))
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoad_ReceiversAndProbes(t *testing.T) {
+	t.Setenv("NODUX_TEST_TG", "123:abc")
+	t.Setenv("NODUX_TEST_TOPIC", "alerts-xyz")
+	t.Setenv("NODUX_TEST_PROBE_TOKEN", "tok")
+	cfg, err := Load(write(t, `
+probes:
+  targets:
+    - name: api
+      url: https://example.com/health?token=${NODUX_TEST_PROBE_TOKEN}
+      container: api
+      status: [200, 204]
+    - {name: mail, tls: "mail.example.com:465"}
+actions:
+  receivers:
+    - name: oncall
+      type: telegram
+      bot_token: ${NODUX_TEST_TG}
+      chat_id: "-100123"
+      severities: [critical]
+    - name: phone
+      type: ntfy
+      url: https://ntfy.sh/${NODUX_TEST_TOPIC}
+      send_resolved: false
+      timeout_seconds: 10
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Actions.Receivers
+	if len(r) != 2 || r[0].BotToken != "123:abc" || r[1].URL != "https://ntfy.sh/alerts-xyz" {
+		t.Fatalf("receivers = %+v", r)
+	}
+	if !r[0].Resolved() || r[1].Resolved() || r[0].Timeout() != 5*time.Second || r[1].Timeout() != 10*time.Second {
+		t.Errorf("defaults: %+v", r)
+	}
+	p := cfg.Probes
+	if p.Targets[0].URL != "https://example.com/health?token=tok" || p.Interval() != 30*time.Second || p.Failures != 2 {
+		t.Errorf("probes = %+v", p)
+	}
+}
+
+func TestLoad_NewDefaults(t *testing.T) {
+	cfg, err := Load(write(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := cfg.Host
+	if !h.Pressure.Enabled || h.Pressure.MemorySome != 10 || h.Pressure.IOFull != 10 || h.Pressure.CPUSome != 0 || !h.OOM.Enabled {
+		t.Errorf("host = %+v", h)
+	}
+	if f := h.Disk.Forecast; !f.Enabled || f.Window() != time.Hour || f.Horizon() != 12*time.Hour {
+		t.Errorf("forecast = %+v", f)
+	}
+	if c := cfg.Detectors.CPUThrottle; !c.Enabled || c.ThresholdPercent != 25 || c.For() != 5*time.Minute {
+		t.Errorf("cpu_throttle = %+v", c)
+	}
+	if cfg.Silences.DeployGrace() != 2*time.Minute || cfg.Server.SocketPath != "/run/nodux/nodux.sock" || cfg.Server.Listen != "" {
+		t.Errorf("silences/server = %+v %+v", cfg.Silences, cfg.Server)
 	}
 }

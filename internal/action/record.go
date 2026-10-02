@@ -39,6 +39,7 @@ type Record struct {
 	HealthStatus  string   `json:"health_status,omitempty"`
 	MemoryUsed    uint64   `json:"memory_used_bytes,omitempty"`
 	MemoryLimit   uint64   `json:"memory_limit_bytes,omitempty"`
+	Silenced      bool     `json:"silenced,omitempty"`
 	Analysis      string   `json:"analysis,omitempty"`
 	Logs          []string `json:"logs,omitempty"`
 }
@@ -63,6 +64,7 @@ func NewRecord(issue detector.Issue) Record {
 		HealthStatus:  c.HealthStatus,
 		MemoryUsed:    c.MemoryUsed,
 		MemoryLimit:   c.MemoryLimit,
+		Silenced:      issue.Silenced,
 		Analysis:      issue.Analysis,
 		Logs:          issue.Logs,
 	}

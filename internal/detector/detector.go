@@ -11,8 +11,9 @@
 //     State.OOMKilled as soon as a restart policy brings the container
 //     back up, so an OOM in a restarting container is only reliably
 //     visible as an "oom" event. Its issues are one-off alerts.
-//   - HostDetector checks the host itself (disk, memory, CPU), also
-//     level-triggered, returning every problem that currently holds.
+//   - HostDetector checks the host itself (disk, memory, CPU, pressure)
+//     or something outside it (probes), also level-triggered, returning
+//     every problem that currently holds.
 //
 // Fetching logs and dispatching actions is the engine's job, not the
 // detector's.
@@ -34,6 +35,8 @@ type ContainerSnapshot struct {
 	OOMKilled    bool
 	StartedAt    time.Time
 	FinishedAt   time.Time
+	// Tty says how to read the container's logs (raw vs multiplexed).
+	Tty bool
 
 	// Health is empty when the container has no healthcheck.
 	HealthStatus        string // starting, healthy, unhealthy
@@ -57,14 +60,27 @@ type ContainerSnapshot struct {
 	// LastRun is how long the container's last run lasted before it
 	// exited, when the event stream told us. 0 = unknown.
 	LastRun time.Duration
+
+	// CPU throttling counters (cumulative since the container started),
+	// only filled in for running containers with a CPU limit, and only
+	// when a detector needs them. CPULimit 0 = not collected.
+	CPULimit            float64 // in CPUs, e.g. 0.5 for --cpus 0.5
+	CPUPeriods          uint64
+	CPUThrottledPeriods uint64
 }
+
+// Project is the container's compose project, "" if compose didn't
+// start it.
+func (s ContainerSnapshot) Project() string { return s.Labels[LabelComposeProject] }
 
 // ContainerEvent is a container lifecycle event from the daemon.
 type ContainerEvent struct {
-	ID       string
-	Name     string
-	Action   string // start, kill, oom, die, destroy
-	ExitCode int    // only meaningful for "die"
+	ID     string
+	Name   string
+	Action string // create, start, kill, oom, die, destroy, health_status
+	// HealthStatus is the new status of a health_status event.
+	HealthStatus string
+	ExitCode     int // only meaningful for "die"
 	// Signal is the signal a "kill" event delivered, 0 if unknown.
 	Signal int
 	// StopSignal is the container's configured stop signal (what docker
@@ -96,6 +112,8 @@ type Issue struct {
 	// Resolved marks the "problem is over" notification that follows a
 	// level-triggered alert.
 	Resolved bool
+	// Silenced alerts are logged locally but not sent to receivers.
+	Silenced bool
 	// Key identifies the episode a level-triggered alert and its
 	// resolution belong to (set by the engine). Empty for one-off alerts.
 	Key string
@@ -131,6 +149,15 @@ type EventDetector interface {
 	HandleEvent(ev ContainerEvent) *Issue
 }
 
+// Confirmer is implemented by event detectors whose events only say
+// "look at this container now": a health_status event carries no
+// healthcheck output. The engine inspects the container and replaces
+// the event's issue with Confirm's verdict on the full snapshot; nil
+// drops it.
+type Confirmer interface {
+	Confirm(s ContainerSnapshot) *Issue
+}
+
 // HostDetector checks something about the host rather than a
 // container. Check returns every problem that currently holds; each
 // Issue must have a Resource that identifies it across calls.
@@ -160,8 +187,21 @@ type Stateful interface {
 	LoadState(data []byte) error
 }
 
-// EventActions are the event types event detectors are fed.
-var EventActions = []string{"start", "kill", "oom", "die", "destroy"}
+// EventActions are the event types nodux subscribes to. The daemon
+// matches "health_status" against "health_status: unhealthy" and
+// friends. "create" is only used to spot deploys.
+var EventActions = []string{"create", "start", "kill", "oom", "die", "destroy", "health_status"}
+
+// SeverityRank orders severities: a higher rank is more urgent.
+func SeverityRank(s string) int {
+	switch s {
+	case SeverityCritical:
+		return 2
+	case SeverityWarning:
+		return 1
+	}
+	return 0
+}
 
 // Truncate cuts s to at most n bytes without splitting a UTF-8
 // sequence, marking the cut with "…".

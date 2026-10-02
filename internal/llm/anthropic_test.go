@@ -351,7 +351,13 @@ func TestAnthropic_HourlyBudget(t *testing.T) {
 	if _, err := c.Analyze(context.Background(), incident()); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("err = %v, want budget exhausted", err)
 	}
+	if b := c.Budget(); b.MaxPerHour != 2 || b.Remaining != 0 || b.OK != 2 || b.OverBudget != 1 {
+		t.Errorf("budget = %+v", b)
+	}
 	now = now.Add(61 * time.Minute)
+	if b := c.Budget(); b.Remaining != 2 {
+		t.Errorf("budget not refilled: %+v", b)
+	}
 	if _, err := c.Analyze(context.Background(), incident()); err != nil {
 		t.Fatalf("budget should refill after an hour: %v", err)
 	}

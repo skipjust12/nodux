@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -33,18 +35,21 @@ type Config struct {
 	// oom) from the same detector for the same container name. 0
 	// disables the cooldown.
 	AlertCooldownMinutes int `yaml:"alert_cooldown_minutes"`
-	// StateDir keeps open alerts, detector state and the event stream
-	// position (state.json) and the alert history (history.db) across
-	// restarts. Empty keeps everything in memory.
+	// StateDir keeps open alerts, detector state, silences and the event
+	// stream position (state.json) and the alert history (history.db)
+	// across restarts. Empty keeps everything in memory.
 	StateDir          string          `yaml:"state_dir"`
 	History           HistoryConfig   `yaml:"history"`
 	Docker            DockerConfig    `yaml:"docker"`
 	ExcludeContainers []string        `yaml:"exclude_containers"`
 	Detectors         DetectorsConfig `yaml:"detectors"`
 	Host              HostConfig      `yaml:"host"`
+	Probes            ProbesConfig    `yaml:"probes"`
 	Incidents         IncidentsConfig `yaml:"incidents"`
 	Redact            RedactConfig    `yaml:"redact"`
 	Actions           ActionsConfig   `yaml:"actions"`
+	Silences          SilencesConfig  `yaml:"silences"`
+	Server            ServerConfig    `yaml:"server"`
 	Heartbeat         HeartbeatConfig `yaml:"heartbeat"`
 	LLM               LLMConfig       `yaml:"llm"`
 	Digest            DigestConfig    `yaml:"digest"`
@@ -100,6 +105,9 @@ type DetectorsConfig struct {
 	Exit      ExitConfig      `yaml:"exit"`
 	Memory    MemoryConfig    `yaml:"memory"`
 	Expected  ExpectedConfig  `yaml:"expected"`
+	// CPUThrottle: the share of CFS periods a CPU-limited container was
+	// throttled in.
+	CPUThrottle ThresholdConfig `yaml:"cpu_throttle"`
 }
 
 // ToggleConfig is for detectors that have nothing to tune.
@@ -141,12 +149,64 @@ type HostConfig struct {
 	Disk     DiskConfig      `yaml:"disk"`
 	Memory   ThresholdConfig `yaml:"memory"`
 	CPU      ThresholdConfig `yaml:"cpu"`
+	Pressure PressureConfig  `yaml:"pressure"`
+	OOM      ToggleConfig    `yaml:"oom"`
 }
 
 type DiskConfig struct {
 	Enabled          bool     `yaml:"enabled"`
 	Paths            []string `yaml:"paths"`
 	ThresholdPercent float64  `yaml:"threshold_percent"`
+	// Forecast predicts when each path will be full; it uses the same
+	// paths and runs even if the static threshold is off.
+	Forecast DiskForecastConfig `yaml:"forecast"`
+}
+
+type DiskForecastConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// WindowMinutes of samples the fill rate is computed over.
+	WindowMinutes int `yaml:"window_minutes"`
+	// HorizonHours: alert when the disk is projected to be full sooner.
+	HorizonHours int `yaml:"horizon_hours"`
+}
+
+// PressureConfig sets avg60 thresholds (percent of wall time stalled)
+// for /proc/pressure; 0 turns a signal off.
+type PressureConfig struct {
+	Enabled    bool    `yaml:"enabled"`
+	MemorySome float64 `yaml:"memory_some_percent"`
+	MemoryFull float64 `yaml:"memory_full_percent"`
+	IOSome     float64 `yaml:"io_some_percent"`
+	IOFull     float64 `yaml:"io_full_percent"`
+	CPUSome    float64 `yaml:"cpu_some_percent"`
+	ForSeconds int     `yaml:"for_seconds"`
+}
+
+type ProbesConfig struct {
+	IntervalSeconds int `yaml:"interval_seconds"`
+	TimeoutSeconds  int `yaml:"timeout_seconds"`
+	// Failures in a row before a probe alerts.
+	Failures int `yaml:"failures"`
+	// CertWarnDays / CertCriticalDays: alert when a certificate seen by
+	// an https or tls probe expires within this many days. 0 disables.
+	CertWarnDays     int           `yaml:"cert_warn_days"`
+	CertCriticalDays int           `yaml:"cert_critical_days"`
+	Targets          []ProbeTarget `yaml:"targets"`
+}
+
+type ProbeTarget struct {
+	Name string `yaml:"name"`
+	// Exactly one of URL (http/https GET), TCP (host:port connect) and
+	// TLS (host:port handshake).
+	URL string `yaml:"url"`
+	TCP string `yaml:"tcp"`
+	TLS string `yaml:"tls"`
+	// Container ties the probe to a container: alerts carry its state
+	// and logs.
+	Container string `yaml:"container"`
+	// Status lists accepted HTTP statuses; empty = 200-399.
+	Status     []int `yaml:"status"`
+	SkipVerify bool  `yaml:"tls_skip_verify"`
 }
 
 type ThresholdConfig struct {
@@ -165,7 +225,52 @@ type RedactConfig struct {
 }
 
 type ActionsConfig struct {
-	Webhook WebhookConfig `yaml:"webhook"`
+	// Webhook is a single receiver that gets everything; kept for
+	// configs written before receivers existed.
+	Webhook   WebhookConfig    `yaml:"webhook"`
+	Receivers []ReceiverConfig `yaml:"receivers"`
+}
+
+// ReceiverConfig is one place alerts go, and which alerts go there.
+type ReceiverConfig struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"` // webhook, telegram or ntfy
+
+	// Routing. Empty severities/detectors = all; detectors are globs.
+	Severities   []string `yaml:"severities"`
+	Detectors    []string `yaml:"detectors"`
+	SendResolved *bool    `yaml:"send_resolved"` // default true
+	Digest       *bool    `yaml:"digest"`        // the periodic digest; default true
+
+	// webhook and ntfy
+	URL            string `yaml:"url"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"` // default 5
+	// webhook
+	Format  string            `yaml:"format"`
+	Headers map[string]string `yaml:"headers"`
+	// telegram
+	BotToken string `yaml:"bot_token"`
+	ChatID   string `yaml:"chat_id"`
+	ThreadID int    `yaml:"thread_id"`
+	APIURL   string `yaml:"api_url"`
+	// ntfy
+	Token string `yaml:"token"`
+}
+
+type SilencesConfig struct {
+	// DeployGraceSeconds: create, stop and remove events for a container
+	// mute its alerts, and those of its compose project, until this long
+	// after the last one. 0 disables it.
+	DeployGraceSeconds int `yaml:"deploy_grace_seconds"`
+}
+
+type ServerConfig struct {
+	// SocketPath is the control socket for nodux status / silence. Empty
+	// disables it.
+	SocketPath string `yaml:"socket_path"`
+	// Listen is a TCP address for /metrics and /healthz, e.g.
+	// 127.0.0.1:9321. Empty disables it.
+	Listen string `yaml:"listen"`
 }
 
 type WebhookConfig struct {
@@ -227,6 +332,32 @@ func (c *CrashLoopConfig) Window() time.Duration {
 }
 
 func (c *MemoryConfig) For() time.Duration      { return seconds(c.ForSeconds) }
+func (c *PressureConfig) For() time.Duration    { return seconds(c.ForSeconds) }
+func (c *ProbesConfig) Interval() time.Duration { return seconds(c.IntervalSeconds) }
+func (c *ProbesConfig) Timeout() time.Duration  { return seconds(c.TimeoutSeconds) }
+func (c *SilencesConfig) DeployGrace() time.Duration {
+	return seconds(c.DeployGraceSeconds)
+}
+func (c *DiskForecastConfig) Window() time.Duration {
+	return time.Duration(c.WindowMinutes) * time.Minute
+}
+func (c *DiskForecastConfig) Horizon() time.Duration {
+	return time.Duration(c.HorizonHours) * time.Hour
+}
+
+// Timeout is the receiver's timeout, 5s unless set.
+func (r *ReceiverConfig) Timeout() time.Duration {
+	if r.TimeoutSeconds == 0 {
+		return 5 * time.Second
+	}
+	return seconds(r.TimeoutSeconds)
+}
+
+// Resolved says whether the receiver gets resolutions (default yes).
+func (r *ReceiverConfig) Resolved() bool { return r.SendResolved == nil || *r.SendResolved }
+
+// Digests says whether the receiver gets the digest (default yes).
+func (r *ReceiverConfig) Digests() bool         { return r.Digest == nil || *r.Digest }
 func (c *ExpectedConfig) Grace() time.Duration  { return seconds(c.GraceSeconds) }
 func (c *ThresholdConfig) For() time.Duration   { return seconds(c.ForSeconds) }
 func (c *WebhookConfig) Timeout() time.Duration { return seconds(c.TimeoutSeconds) }
@@ -259,20 +390,34 @@ func Default() *Config {
 			DownAlertAfterSeconds: 60,
 		},
 		Detectors: DetectorsConfig{
-			CrashLoop: CrashLoopConfig{Enabled: true, RestartThreshold: 3, WindowMinutes: 5},
-			OOM:       ToggleConfig{Enabled: true},
-			Unhealthy: ToggleConfig{Enabled: true},
-			Exit:      ExitConfig{Enabled: true, IgnoreExitCodes: []int{0}},
-			Memory:    MemoryConfig{Enabled: true, ThresholdPercent: 90, ForSeconds: 60},
-			Expected:  ExpectedConfig{Enabled: true, GraceSeconds: 60},
+			CrashLoop:   CrashLoopConfig{Enabled: true, RestartThreshold: 3, WindowMinutes: 5},
+			OOM:         ToggleConfig{Enabled: true},
+			Unhealthy:   ToggleConfig{Enabled: true},
+			Exit:        ExitConfig{Enabled: true, IgnoreExitCodes: []int{0}},
+			Memory:      MemoryConfig{Enabled: true, ThresholdPercent: 90, ForSeconds: 60},
+			Expected:    ExpectedConfig{Enabled: true, GraceSeconds: 60},
+			CPUThrottle: ThresholdConfig{Enabled: true, ThresholdPercent: 25, ForSeconds: 300},
 		},
 		Host: HostConfig{
 			ProcPath: "/proc",
-			Disk:     DiskConfig{Enabled: true, Paths: []string{"/"}, ThresholdPercent: 90},
-			Memory:   ThresholdConfig{Enabled: true, ThresholdPercent: 90, ForSeconds: 300},
-			CPU:      ThresholdConfig{Enabled: true, ThresholdPercent: 95, ForSeconds: 600},
+			Disk: DiskConfig{
+				Enabled: true, Paths: []string{"/"}, ThresholdPercent: 90,
+				Forecast: DiskForecastConfig{Enabled: true, WindowMinutes: 60, HorizonHours: 12},
+			},
+			Memory: ThresholdConfig{Enabled: true, ThresholdPercent: 90, ForSeconds: 300},
+			CPU:    ThresholdConfig{Enabled: true, ThresholdPercent: 95, ForSeconds: 600},
+			Pressure: PressureConfig{
+				Enabled: true, MemorySome: 10, IOFull: 10, ForSeconds: 60,
+			},
+			OOM: ToggleConfig{Enabled: true},
 		},
-		Redact: RedactConfig{Defaults: true},
+		Probes: ProbesConfig{
+			IntervalSeconds: 30, TimeoutSeconds: 5, Failures: 2,
+			CertWarnDays: 14, CertCriticalDays: 3,
+		},
+		Redact:   RedactConfig{Defaults: true},
+		Silences: SilencesConfig{DeployGraceSeconds: 120},
+		Server:   ServerConfig{SocketPath: "/run/nodux/nodux.sock"},
 		Actions: ActionsConfig{Webhook: WebhookConfig{
 			Format:         "json",
 			TimeoutSeconds: 5,
@@ -344,6 +489,25 @@ func (c *Config) expandEnv() error {
 			wh.Headers[k] = expand("actions.webhook.headers."+k, v)
 		}
 	}
+	for i := range c.Actions.Receivers {
+		r := &c.Actions.Receivers[i]
+		field := fmt.Sprintf("actions.receivers[%d]", i)
+		if r.Name != "" {
+			field = "actions.receivers." + r.Name
+		}
+		r.URL = expand(field+".url", r.URL)
+		r.APIURL = expand(field+".api_url", r.APIURL)
+		r.BotToken = expand(field+".bot_token", r.BotToken)
+		r.ChatID = expand(field+".chat_id", r.ChatID)
+		r.Token = expand(field+".token", r.Token)
+		for k, v := range r.Headers {
+			r.Headers[k] = expand(field+".headers."+k, v)
+		}
+	}
+	for i := range c.Probes.Targets {
+		t := &c.Probes.Targets[i]
+		t.URL = expand("probes.targets."+t.Name+".url", t.URL)
+	}
 	if hb := &c.Heartbeat; hb.Enabled {
 		hb.URL = expand("heartbeat.url", hb.URL)
 	}
@@ -403,14 +567,40 @@ func (c *Config) validate() error {
 	if d.Expected.Enabled && d.Expected.GraceSeconds < 0 {
 		return fmt.Errorf("detectors.expected.grace_seconds must not be negative")
 	}
+	if d.CPUThrottle.Enabled {
+		if err := checkThreshold("detectors.cpu_throttle", d.CPUThrottle.ThresholdPercent, d.CPUThrottle.ForSeconds); err != nil {
+			return err
+		}
+	}
 
 	h := c.Host
+	if (h.Disk.Enabled || h.Disk.Forecast.Enabled) && len(h.Disk.Paths) == 0 {
+		return fmt.Errorf("host.disk.paths must list at least one path")
+	}
 	if h.Disk.Enabled {
-		if len(h.Disk.Paths) == 0 {
-			return fmt.Errorf("host.disk.paths must list at least one path")
-		}
 		if err := checkThreshold("host.disk", h.Disk.ThresholdPercent, 0); err != nil {
 			return err
+		}
+	}
+	if f := h.Disk.Forecast; f.Enabled {
+		if f.WindowMinutes <= 0 {
+			return fmt.Errorf("host.disk.forecast.window_minutes must be positive")
+		}
+		if f.HorizonHours <= 0 {
+			return fmt.Errorf("host.disk.forecast.horizon_hours must be positive")
+		}
+	}
+	if p := h.Pressure; p.Enabled {
+		for name, v := range map[string]float64{
+			"memory_some_percent": p.MemorySome, "memory_full_percent": p.MemoryFull,
+			"io_some_percent": p.IOSome, "io_full_percent": p.IOFull, "cpu_some_percent": p.CPUSome,
+		} {
+			if v < 0 || v > 100 {
+				return fmt.Errorf("host.pressure.%s must be in [0, 100]", name)
+			}
+		}
+		if p.ForSeconds < 0 {
+			return fmt.Errorf("host.pressure.for_seconds must not be negative")
 		}
 	}
 	if h.Memory.Enabled {
@@ -423,7 +613,7 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
-	if (h.Memory.Enabled || h.CPU.Enabled) && h.ProcPath == "" {
+	if (h.Memory.Enabled || h.CPU.Enabled || h.Pressure.Enabled || h.OOM.Enabled) && h.ProcPath == "" {
 		return fmt.Errorf("host.proc_path must not be empty")
 	}
 
@@ -442,6 +632,10 @@ func (c *Config) validate() error {
 		}
 	}
 
+	if err := c.Probes.validate(); err != nil {
+		return err
+	}
+
 	if wh := c.Actions.Webhook; wh.Enabled {
 		if err := checkURL("actions.webhook.url", wh.URL); err != nil {
 			return err
@@ -451,6 +645,27 @@ func (c *Config) validate() error {
 		}
 		if wh.TimeoutSeconds <= 0 {
 			return fmt.Errorf("actions.webhook.timeout_seconds must be positive")
+		}
+	}
+	names := map[string]bool{}
+	if c.Actions.Webhook.Enabled {
+		names["webhook"] = true
+	}
+	for i, r := range c.Actions.Receivers {
+		if err := r.validate(); err != nil {
+			return fmt.Errorf("actions.receivers[%d]: %w", i, err)
+		}
+		if names[r.Name] {
+			return fmt.Errorf("actions.receivers[%d]: duplicate name %q", i, r.Name)
+		}
+		names[r.Name] = true
+	}
+	if c.Silences.DeployGraceSeconds < 0 {
+		return fmt.Errorf("silences.deploy_grace_seconds must not be negative")
+	}
+	if l := c.Server.Listen; l != "" {
+		if _, _, err := net.SplitHostPort(l); err != nil {
+			return fmt.Errorf("server.listen must be host:port, got %q", l)
 		}
 	}
 	if hb := c.Heartbeat; hb.Enabled {
@@ -499,6 +714,151 @@ func (c *Config) validate() error {
 	}
 	if tg := c.ChatOps.Telegram; tg.Enabled && tg.Token == "" {
 		return fmt.Errorf("chatops.telegram.token must be set when the bot is enabled")
+	}
+	return nil
+}
+
+func (p *ProbesConfig) validate() error {
+	if len(p.Targets) == 0 {
+		return nil
+	}
+	if p.IntervalSeconds <= 0 {
+		return fmt.Errorf("probes.interval_seconds must be positive")
+	}
+	if p.TimeoutSeconds <= 0 {
+		return fmt.Errorf("probes.timeout_seconds must be positive")
+	}
+	if p.Failures <= 0 {
+		return fmt.Errorf("probes.failures must be positive")
+	}
+	if p.CertWarnDays < 0 || p.CertCriticalDays < 0 {
+		return fmt.Errorf("probes.cert_warn_days and cert_critical_days must not be negative")
+	}
+	if p.CertWarnDays > 0 && p.CertCriticalDays > p.CertWarnDays {
+		return fmt.Errorf("probes.cert_critical_days must not be more than cert_warn_days")
+	}
+	seen := map[string]bool{}
+	for i, t := range p.Targets {
+		field := fmt.Sprintf("probes.targets[%d]", i)
+		if t.Name == "" {
+			return fmt.Errorf("%s: name must be set", field)
+		}
+		if seen[t.Name] {
+			return fmt.Errorf("%s: duplicate name %q", field, t.Name)
+		}
+		seen[t.Name] = true
+		field = "probes.targets." + t.Name
+
+		set := 0
+		for _, v := range []string{t.URL, t.TCP, t.TLS} {
+			if v != "" {
+				set++
+			}
+		}
+		if set != 1 {
+			return fmt.Errorf("%s: set exactly one of url, tcp and tls", field)
+		}
+		switch {
+		case t.URL != "":
+			if err := checkURL(field+".url", t.URL); err != nil {
+				return err
+			}
+		case t.TCP != "":
+			if _, _, err := net.SplitHostPort(t.TCP); err != nil {
+				return fmt.Errorf("%s.tcp must be host:port, got %q", field, t.TCP)
+			}
+		default:
+			if _, _, err := net.SplitHostPort(t.TLS); err != nil {
+				return fmt.Errorf("%s.tls must be host:port, got %q", field, t.TLS)
+			}
+		}
+		if len(t.Status) > 0 && t.URL == "" {
+			return fmt.Errorf("%s: status only applies to url probes", field)
+		}
+		for _, code := range t.Status {
+			if code < 100 || code > 599 {
+				return fmt.Errorf("%s.status: %d is not an HTTP status", field, code)
+			}
+		}
+		if t.SkipVerify && t.TCP != "" {
+			return fmt.Errorf("%s: tls_skip_verify doesn't apply to tcp probes", field)
+		}
+	}
+	return nil
+}
+
+func (r *ReceiverConfig) validate() error {
+	if r.Name == "" {
+		return fmt.Errorf("name must be set")
+	}
+	for _, s := range r.Severities {
+		if s != "warning" && s != "critical" {
+			return fmt.Errorf("%s: severities must be warning or critical, got %q", r.Name, s)
+		}
+	}
+	for _, d := range r.Detectors {
+		if _, err := path.Match(d, ""); err != nil {
+			return fmt.Errorf("%s: bad detector pattern %q", r.Name, d)
+		}
+	}
+	if r.TimeoutSeconds < 0 {
+		return fmt.Errorf("%s: timeout_seconds must not be negative", r.Name)
+	}
+
+	// Fields that belong to another type are almost certainly a mistake.
+	foreign := map[string]bool{
+		"url":       r.URL != "",
+		"format":    r.Format != "",
+		"headers":   len(r.Headers) > 0,
+		"bot_token": r.BotToken != "",
+		"chat_id":   r.ChatID != "",
+		"thread_id": r.ThreadID != 0,
+		"api_url":   r.APIURL != "",
+		"token":     r.Token != "",
+	}
+	var allowed []string
+	switch r.Type {
+	case "webhook":
+		allowed = []string{"url", "format", "headers"}
+		if err := checkURL("actions.receivers."+r.Name+".url", r.URL); err != nil {
+			return err
+		}
+		if r.Format != "" && r.Format != "json" && r.Format != "slack" {
+			return fmt.Errorf("%s: format must be json or slack, got %q", r.Name, r.Format)
+		}
+	case "telegram":
+		allowed = []string{"bot_token", "chat_id", "thread_id", "api_url"}
+		if r.BotToken == "" || r.ChatID == "" {
+			return fmt.Errorf("%s: telegram needs bot_token and chat_id", r.Name)
+		}
+		if r.APIURL != "" {
+			if err := checkURL("actions.receivers."+r.Name+".api_url", r.APIURL); err != nil {
+				return err
+			}
+		}
+	case "ntfy":
+		allowed = []string{"url", "token"}
+		if err := checkURL("actions.receivers."+r.Name+".url", r.URL); err != nil {
+			return err
+		}
+		if u, _ := url.Parse(r.URL); strings.Trim(u.Path, "/") == "" {
+			return fmt.Errorf("%s: ntfy url must include the topic (https://ntfy.sh/mytopic)", r.Name)
+		}
+	default:
+		return fmt.Errorf("%s: type must be webhook, telegram or ntfy, got %q", r.Name, r.Type)
+	}
+	for _, a := range allowed {
+		delete(foreign, a)
+	}
+	var bad []string
+	for k, set := range foreign {
+		if set {
+			bad = append(bad, k)
+		}
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		return fmt.Errorf("%s: %s don't apply to type %s", r.Name, strings.Join(bad, ", "), r.Type)
 	}
 	return nil
 }

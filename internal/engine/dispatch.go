@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/skipjust12/nodux/internal/action"
+	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/history"
 	"github.com/skipjust12/nodux/internal/incident"
 	"github.com/skipjust12/nodux/internal/llm"
@@ -28,7 +29,8 @@ const (
 // dispatch files queued alerts under incidents and hands batches that
 // are due to the delivery goroutine, until the queue is closed. Then
 // it flushes everything still held back, so nothing is lost on
-// shutdown.
+// shutdown. Silenced alerts skip incidents: they only go to the local
+// log, so they mustn't hold up, or show up in, what receivers get.
 func (e *Engine) dispatch(ctx context.Context) {
 	batches := make(chan incident.Batch, batchQueue)
 	delivered := make(chan struct{})
@@ -55,7 +57,11 @@ func (e *Engine) dispatch(ctx context.Context) {
 				<-delivered
 				return
 			}
-			e.grouper.Add(issue)
+			if issue.Silenced {
+				batches <- incident.Batch{Alerts: []detector.Issue{issue}}
+			} else {
+				e.grouper.Add(issue)
+			}
 		case <-wake:
 		}
 		for _, b := range e.grouper.Due(e.now()) {
@@ -99,8 +105,9 @@ func (e *Engine) analyze(ctx context.Context, group []incident.Batch) []string {
 	var wg sync.WaitGroup
 	for i := range group {
 		b := &group[i]
-		// Resolutions only say that something is over.
-		if !b.Firing() {
+		// Resolutions only say that something is over, and silenced
+		// alerts aren't worth the budget.
+		if !audible(b.Alerts) {
 			continue
 		}
 		wg.Add(1)
@@ -121,6 +128,17 @@ func (e *Engine) analyze(ctx context.Context, group []incident.Batch) []string {
 	}
 	wg.Wait()
 	return summaries
+}
+
+// audible reports whether a batch has a firing alert that isn't
+// silenced.
+func audible(alerts []detector.Issue) bool {
+	for _, a := range alerts {
+		if !a.Resolved && !a.Silenced {
+			return true
+		}
+	}
+	return false
 }
 
 // incidentFor gathers what the analyzer should know about a batch:
@@ -181,6 +199,9 @@ func (e *Engine) send(b incident.Batch, summary string) {
 		}
 		e.grouper.SetSummary(b.IncidentID, summary)
 	}
+	for _, issue := range b.Alerts {
+		e.count(issue)
+	}
 	n := action.Notification{IncidentID: b.IncidentID, Update: b.Update, Alerts: b.Alerts, Summary: summary}
 	for _, a := range e.opts.Actions {
 		if err := a.Send(context.Background(), n); err != nil {
@@ -188,12 +209,29 @@ func (e *Engine) send(b incident.Batch, summary string) {
 		}
 	}
 	if e.opts.History != nil {
+		// What was sent: a silenced alert is recorded if and when it
+		// goes out after its silence.
 		rows := make([]history.Alert, 0, len(b.Alerts))
 		for _, issue := range b.Alerts {
-			rows = append(rows, history.AlertFromIssue(issue, issue.Analysis))
+			if !issue.Silenced {
+				rows = append(rows, history.AlertFromIssue(issue, issue.Analysis))
+			}
+		}
+		if len(rows) == 0 {
+			return
 		}
 		if err := e.opts.History.AddAlerts(context.Background(), rows); err != nil {
 			slog.Warn("recording alert history failed", "error", err)
 		}
 	}
+}
+
+func (e *Engine) count(issue detector.Issue) {
+	state := action.StateFiring
+	if issue.Resolved {
+		state = action.StateResolved
+	}
+	e.mu.Lock()
+	e.counts[AlertKey{Detector: issue.Detector, Severity: issue.Severity, State: state, Silenced: issue.Silenced}]++
+	e.mu.Unlock()
 }

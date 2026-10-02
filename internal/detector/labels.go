@@ -14,7 +14,8 @@ import (
 //	nodux.enable=false               never check this container
 //	nodux.expected=true              this container must be running
 //	nodux.<detector>.enable=false    turn one detector off (crashloop,
-//	                                 unhealthy, oom, exit, memory)
+//	                                 unhealthy, oom, exit, memory,
+//	                                 cpu_throttle)
 //	nodux.memory.threshold=80        percent of the memory limit
 //	nodux.memory.for=2m              how long it has to stay there
 //	nodux.crashloop.threshold=5      restarts...
