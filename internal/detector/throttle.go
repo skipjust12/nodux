@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -27,6 +28,9 @@ type throttleState struct {
 	periods   uint64
 	throttled uint64
 	lastPct   float64
+	// baseline: the next sample only sets the counters to compare with
+	// (a new container, or state restored after a restart).
+	baseline bool
 }
 
 func NewThrottleDetector(thresholdPercent float64, sustain time.Duration) *ThrottleDetector {
@@ -48,10 +52,14 @@ func (d *ThrottleDetector) Check(s ContainerSnapshot) *Issue {
 	}
 	st := d.state[s.ID]
 	if st == nil {
-		d.state[s.ID] = &throttleState{
-			gate:      gate{threshold: d.threshold, sustain: d.sustain},
-			periods:   s.CPUPeriods,
-			throttled: s.CPUThrottledPeriods,
+		st = &throttleState{gate: gate{threshold: d.threshold, sustain: d.sustain}, baseline: true}
+		d.state[s.ID] = st
+	}
+	if st.baseline {
+		st.baseline = false
+		st.periods, st.throttled = s.CPUPeriods, s.CPUThrottledPeriods
+		if st.gate.firing {
+			return d.issue(s, st.lastPct)
 		}
 		return nil
 	}
@@ -75,7 +83,10 @@ func (d *ThrottleDetector) Check(s ContainerSnapshot) *Issue {
 	if !st.gate.update(d.now(), pct) {
 		return nil
 	}
+	return d.issue(s, pct)
+}
 
+func (d *ThrottleDetector) issue(s ContainerSnapshot, pct float64) *Issue {
 	msg := fmt.Sprintf("CPU throttled in %.0f%% of scheduling periods at a limit of %s", pct, formatCPUs(s.CPULimit))
 	if d.sustain > 0 {
 		msg += fmt.Sprintf(" for at least %s", d.sustain)
@@ -92,6 +103,34 @@ func (d *ThrottleDetector) Check(s ContainerSnapshot) *Issue {
 
 func (d *ThrottleDetector) Forget(containerID string) {
 	delete(d.state, containerID)
+}
+
+// SaveState keeps which containers are firing and at what ratio. The
+// counters aren't saved: the first poll after a restart takes a fresh
+// baseline.
+func (d *ThrottleDetector) SaveState() ([]byte, error) {
+	firing := make(map[string]float64)
+	for id, st := range d.state {
+		if st.gate.firing {
+			firing[id] = st.lastPct
+		}
+	}
+	return json.Marshal(firing)
+}
+
+func (d *ThrottleDetector) LoadState(data []byte) error {
+	var firing map[string]float64
+	if err := json.Unmarshal(data, &firing); err != nil {
+		return err
+	}
+	for id, pct := range firing {
+		d.state[id] = &throttleState{
+			gate:     gate{threshold: d.threshold, sustain: d.sustain, firing: true},
+			lastPct:  pct,
+			baseline: true,
+		}
+	}
+	return nil
 }
 
 func formatCPUs(n float64) string {

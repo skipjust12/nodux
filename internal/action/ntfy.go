@@ -1,11 +1,8 @@
 package action
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -17,6 +14,7 @@ const (
 	ntfyMaxMessage = 3800 // ntfy turns longer messages into attachments
 	ntfyLogLines   = 10
 	ntfyLineMax    = 300
+	ntfyItemMax    = 300
 )
 
 type NtfyConfig struct {
@@ -31,9 +29,10 @@ type NtfyConfig struct {
 	Timeout time.Duration
 }
 
-// NewNtfy publishes each alert to an ntfy topic. Critical alerts get
-// the highest priority (on phones that can break through do-not-disturb),
-// warnings the default one, resolutions a low one.
+// NewNtfy publishes each notification to an ntfy topic. Critical alerts
+// get the highest priority (on phones that can break through
+// do-not-disturb), warnings the default one, resolutions and digests a
+// low one.
 func NewNtfy(cfg NtfyConfig) (*HTTPAction, error) {
 	base, topic, err := splitNtfyURL(cfg.URL)
 	if err != nil {
@@ -42,20 +41,13 @@ func NewNtfy(cfg NtfyConfig) (*HTTPAction, error) {
 	if cfg.Name == "" {
 		cfg.Name = "ntfy"
 	}
-	return newHTTPAction(cfg.Name, cfg.URL, cfg.Timeout, func(ctx context.Context, issue detector.Issue) (*http.Request, error) {
-		body, err := json.Marshal(ntfyMessage(topic, issue))
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if cfg.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+cfg.Token)
-		}
-		return req, nil
+	var headers map[string]string
+	if cfg.Token != "" {
+		headers = map[string]string{"Authorization": "Bearer " + cfg.Token}
+	}
+	return newHTTPAction(cfg.Name, base, headers, cfg.Timeout, func(n Notification) ([][]byte, error) {
+		b, err := json.Marshal(ntfyMessage(topic, n))
+		return [][]byte{b}, err
 	}), nil
 }
 
@@ -88,28 +80,70 @@ type ntfyPublish struct {
 	Tags     []string `json:"tags,omitempty"`
 }
 
-func ntfyMessage(topic string, issue detector.Issue) ntfyPublish {
-	title := headline(issue)
-	if s := subject(issue); s != "" {
-		title += " " + s
-	}
-	if issue.Host != "" {
-		title += " on " + issue.Host
+func ntfyMessage(topic string, n Notification) ntfyPublish {
+	m := ntfyPublish{Topic: topic}
+	if n.Digest != nil {
+		m.Title = n.Digest.Title
+		if n.Digest.Host != "" {
+			m.Title += " for " + n.Digest.Host
+		}
+		m.Message = detector.Truncate(n.Digest.Text, ntfyMaxMessage)
+		m.Priority, m.Tags = 2, []string{"bar_chart"}
+		return m
 	}
 
-	m := ntfyPublish{Topic: topic, Title: title, Priority: 3, Tags: []string{"warning"}}
+	label, nFiring, nResolved := batchLabel(n.Alerts)
 	switch {
-	case issue.Resolved:
+	case nFiring == 0:
 		m.Priority, m.Tags = 2, []string{"white_check_mark"}
-	case issue.Severity == detector.SeverityCritical:
+	case label == "CRITICAL":
 		m.Priority, m.Tags = 5, []string{"rotating_light"}
+	default:
+		m.Priority, m.Tags = 3, []string{"warning"}
 	}
 
-	text := detector.Truncate(issue.Message, 1500)
-	if issue.Analysis != "" {
-		text += "\n\n" + detector.Truncate(issue.Analysis, 600)
+	var text string
+	if len(n.Alerts) == 1 {
+		issue := n.Alerts[0]
+		m.Title = headline(issue)
+		if s := subject(issue); s != "" {
+			m.Title += " " + s
+		}
+		if issue.Host != "" {
+			m.Title += " on " + issue.Host
+		}
+		text = detector.Truncate(issue.Message, 1500)
+		if issue.Analysis != "" {
+			text += "\n\n" + detector.Truncate(issue.Analysis, 600)
+		}
+	} else {
+		m.Title = fmt.Sprintf("[%s] incident #%d", label, n.IncidentID)
+		if n.Update {
+			m.Title += " (update)"
+		}
+		if host := n.Alerts[0].Host; host != "" {
+			m.Title += " on " + host
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d new, %d resolved", nFiring, nResolved)
+		if n.Summary != "" {
+			b.WriteString("\n\n" + detector.Truncate(n.Summary, 600))
+		}
+		b.WriteString("\n")
+		for _, issue := range n.Alerts {
+			item := issue.Detector
+			if issue.Resolved {
+				item = "resolved " + item
+			}
+			if s := subject(issue); s != "" {
+				item += " " + s
+			}
+			b.WriteString("\n• " + detector.Truncate(item+": "+issue.Message, ntfyItemMax))
+		}
+		text = detector.Truncate(b.String(), ntfyMaxMessage-200)
 	}
-	lines := lastLines(issue.Logs, ntfyLogLines, ntfyLineMax)
+
+	lines := lastLines(firstLogs(n.Alerts), ntfyLogLines, ntfyLineMax)
 	for len(lines) > 0 {
 		block := "\n\n" + strings.Join(lines, "\n")
 		if len(text)+len(block) <= ntfyMaxMessage {

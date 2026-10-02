@@ -35,9 +35,6 @@ type ContainerSnapshot struct {
 	OOMKilled    bool
 	StartedAt    time.Time
 	FinishedAt   time.Time
-	// Project is the compose project (com.docker.compose.project label),
-	// empty for containers not started by compose.
-	Project string
 	// Tty says how to read the container's logs (raw vs multiplexed).
 	Tty bool
 
@@ -51,6 +48,19 @@ type ContainerSnapshot struct {
 	MemoryUsed  uint64
 	MemoryLimit uint64
 
+	// Configuration, from inspect. Empty for issues built from event
+	// data alone (a container already removed with --rm).
+	Image         string    // as given to docker run: "nginx:1.27"
+	ImageID       string    // sha256:...
+	Created       time.Time // a recent Created usually means a deploy
+	RestartPolicy string    // "always", "on-failure:5", "no", ...
+	MemoryMax     uint64    // the -m limit, 0 = none
+	Labels        map[string]string
+
+	// LastRun is how long the container's last run lasted before it
+	// exited, when the event stream told us. 0 = unknown.
+	LastRun time.Duration
+
 	// CPU throttling counters (cumulative since the container started),
 	// only filled in for running containers with a CPU limit, and only
 	// when a detector needs them. CPULimit 0 = not collected.
@@ -59,13 +69,15 @@ type ContainerSnapshot struct {
 	CPUThrottledPeriods uint64
 }
 
+// Project is the container's compose project, "" if compose didn't
+// start it.
+func (s ContainerSnapshot) Project() string { return s.Labels[LabelComposeProject] }
+
 // ContainerEvent is a container lifecycle event from the daemon.
 type ContainerEvent struct {
 	ID     string
 	Name   string
 	Action string // create, start, kill, oom, die, destroy, health_status
-	// Project is the compose project label, if any.
-	Project string
 	// HealthStatus is the new status of a health_status event.
 	HealthStatus string
 	ExitCode     int // only meaningful for "die"
@@ -75,6 +87,9 @@ type ContainerEvent struct {
 	// stop sends first), 0 if unknown. Only filled in for "kill".
 	StopSignal int
 	Time       time.Time
+	// Labels are the container's nodux.* and com.docker.compose.*
+	// labels, which the daemon includes in event attributes.
+	Labels map[string]string
 }
 
 // Issue is a detected problem, or the resolution of one. Logs is
@@ -99,6 +114,12 @@ type Issue struct {
 	Resolved bool
 	// Silenced alerts are logged locally but not sent to receivers.
 	Silenced bool
+	// Key identifies the episode a level-triggered alert and its
+	// resolution belong to (set by the engine). Empty for one-off alerts.
+	Key string
+	// IncidentID groups alerts that are likely about the same problem
+	// (set when they're dispatched). 0 = not grouped.
+	IncidentID int64
 }
 
 const (
@@ -149,6 +170,21 @@ type HostDetector interface {
 // can drop state for containers that no longer exist.
 type Forgetter interface {
 	Forget(containerID string)
+}
+
+// Stateful is implemented by detectors whose state has to survive a
+// restart of nodux: half-counted crash loops, thresholds that are
+// already firing (they only resolve after dropping below the
+// hysteresis gap), containers already down for part of their grace
+// period. Without it a restart would resolve and re-fire what's still
+// broken.
+//
+// The engine calls SaveState from the poll loop while the event loop is
+// paused, and LoadState before either loop starts.
+type Stateful interface {
+	Name() string
+	SaveState() ([]byte, error)
+	LoadState(data []byte) error
 }
 
 // EventActions are the event types nodux subscribes to. The daemon

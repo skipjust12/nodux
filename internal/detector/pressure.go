@@ -2,6 +2,7 @@ package detector
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -168,4 +169,31 @@ var pressureHints = map[string]string{
 	"io_full":     "every task is waiting on I/O at once: a slow or failing disk, or a noisy neighbour on shared storage",
 	"cpu_some":    "runnable tasks are waiting for a CPU",
 	"cpu_full":    "every task is waiting for a CPU",
+}
+
+// SaveState keeps which signals are firing, so a restart doesn't
+// resolve them while they sit in the hysteresis gap.
+func (d *PressureDetector) SaveState() ([]byte, error) {
+	var firing []string
+	for i, r := range d.rules {
+		if d.gates[i].firing {
+			firing = append(firing, r.Resource+"_"+r.Kind)
+		}
+	}
+	return json.Marshal(firing)
+}
+
+func (d *PressureDetector) LoadState(data []byte) error {
+	var firing []string
+	if err := json.Unmarshal(data, &firing); err != nil {
+		return err
+	}
+	for _, key := range firing {
+		for i, r := range d.rules {
+			if r.Resource+"_"+r.Kind == key {
+				d.gates[i].firing = true
+			}
+		}
+	}
+	return nil
 }

@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -13,6 +14,9 @@ import (
 //
 // Containers without a memory limit are skipped. Their "limit" is the
 // host's RAM, which is what the host_memory detector checks.
+//
+// nodux.memory.threshold and nodux.memory.for override the defaults per
+// container. Only the poll loop touches it, so it needs no lock.
 type MemoryDetector struct {
 	threshold float64
 	sustain   time.Duration
@@ -46,6 +50,12 @@ func (d *MemoryDetector) Check(s ContainerSnapshot) *Issue {
 
 	if g == nil {
 		g = &gate{threshold: d.threshold, sustain: d.sustain}
+		if pct, ok := labelPercent(s.Labels, "nodux.memory.threshold"); ok {
+			g.threshold = pct
+		}
+		if sustain, ok := labelDuration(s.Labels, "nodux.memory.for"); ok {
+			g.sustain = sustain
+		}
 		d.state[s.ID] = g
 	}
 	pct := float64(s.MemoryUsed) / float64(s.MemoryLimit) * 100
@@ -54,8 +64,8 @@ func (d *MemoryDetector) Check(s ContainerSnapshot) *Issue {
 	}
 
 	msg := fmt.Sprintf("memory at %.0f%% of limit (%s / %s)", pct, formatBytes(s.MemoryUsed), formatBytes(s.MemoryLimit))
-	if d.sustain > 0 {
-		msg += fmt.Sprintf(" for at least %s", d.sustain)
+	if g.sustain > 0 {
+		msg += fmt.Sprintf(" for at least %s", g.sustain)
 	}
 	return d.issue(s, msg)
 }
@@ -73,6 +83,38 @@ func (d *MemoryDetector) issue(s ContainerSnapshot, msg string) *Issue {
 func (d *MemoryDetector) Forget(containerID string) {
 	delete(d.state, containerID)
 }
+
+// Only firing gates are saved: one that was merely above the threshold
+// starts its for_seconds over, since nodux didn't see what happened
+// while it was down.
+type savedGate struct {
+	Threshold float64       `json:"threshold"`
+	Sustain   time.Duration `json:"sustain"`
+}
+
+func (d *MemoryDetector) SaveState() ([]byte, error) {
+	firing := make(map[string]savedGate)
+	for id, g := range d.state {
+		if g.firing {
+			firing[id] = savedGate{Threshold: g.threshold, Sustain: g.sustain}
+		}
+	}
+	return json.Marshal(firing)
+}
+
+func (d *MemoryDetector) LoadState(data []byte) error {
+	var firing map[string]savedGate
+	if err := json.Unmarshal(data, &firing); err != nil {
+		return err
+	}
+	for id, g := range firing {
+		d.state[id] = &gate{threshold: g.Threshold, sustain: g.Sustain, firing: true}
+	}
+	return nil
+}
+
+// FormatBytes renders a byte count the way people read them: 1.5GiB.
+func FormatBytes(b uint64) string { return formatBytes(b) }
 
 func formatBytes(b uint64) string {
 	const unit = 1024

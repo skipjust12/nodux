@@ -4,23 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/skipjust12/nodux/internal/detector"
+	"io"
+	"os"
+	"sync"
 )
 
-// ConsoleAction prints a detected problem to stdout as a single JSON
-// line, so it can later be shipped anywhere (journald, Loki, a file, ...).
-type ConsoleAction struct{}
+// ConsoleAction prints alerts to stdout as JSON lines, one per alert
+// (with its incident_id), so they can be shipped anywhere (journald,
+// Loki, a file, ...). A digest is one line of kind "digest".
+type ConsoleAction struct {
+	mu  sync.Mutex
+	out io.Writer
+}
 
-func NewConsole() *ConsoleAction { return &ConsoleAction{} }
+func NewConsole() *ConsoleAction { return &ConsoleAction{out: os.Stdout} }
 
 func (a *ConsoleAction) Name() string { return "console" }
 
-func (a *ConsoleAction) Run(_ context.Context, issue detector.Issue) error {
-	b, err := json.Marshal(NewRecord(issue))
-	if err != nil {
-		return fmt.Errorf("marshal issue: %w", err)
+func (a *ConsoleAction) Send(_ context.Context, n Notification) error {
+	var lines [][]byte
+	if n.Digest != nil {
+		b, err := json.Marshal(NewDigestRecord(n.Digest))
+		if err != nil {
+			return fmt.Errorf("marshal digest: %w", err)
+		}
+		lines = append(lines, b)
 	}
-	fmt.Println(string(b))
+	for _, issue := range n.Alerts {
+		b, err := json.Marshal(NewRecord(issue))
+		if err != nil {
+			return fmt.Errorf("marshal issue: %w", err)
+		}
+		lines = append(lines, b)
+	}
+	// One write per line, never interleaved with a concurrent digest.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, l := range lines {
+		if _, err := a.out.Write(append(l, '\n')); err != nil {
+			return err
+		}
+	}
 	return nil
 }

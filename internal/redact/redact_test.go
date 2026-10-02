@@ -21,6 +21,9 @@ func TestRedactor_Defaults(t *testing.T) {
 		"key AKIAABCDEFGHIJKLMNOP leaked":               "key [REDACTED] leaked",
 		"TOKEN=a TOKEN=b":                               "TOKEN=[REDACTED] TOKEN=[REDACTED]",
 		"nothing to see here, token count is high":      "nothing to see here, token count is high",
+		"server --token abc123 --port 80":               "server --token [REDACTED] --port 80",
+		"mysqld -p --password s3cret":                   "mysqld -p --password [REDACTED]",
+		"rotate --api-key=k1 --secret -v":               "rotate --api-key=[REDACTED] --secret -v",
 	} {
 		if got := r.String(in); got != want {
 			t.Errorf("String(%q)\n got %q\nwant %q", in, got, want)

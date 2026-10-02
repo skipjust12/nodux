@@ -43,7 +43,7 @@ func (fakeReceiver) Stats() action.DeliveryStats {
 
 type fakeLLM struct{}
 
-func (fakeLLM) Usage() llm.Usage { return llm.Usage{MaxPerHour: 30, Remaining: 27, OK: 3} }
+func (fakeLLM) Budget() llm.Budget { return llm.Budget{MaxPerHour: 30, Remaining: 27, OK: 3} }
 
 func source() *Source {
 	return &Source{

@@ -50,7 +50,7 @@ type Source struct {
 	PollInterval time.Duration
 	Silences     *silence.Store // nil: silences are off
 	Receivers    []Receiver
-	LLM          interface{ Usage() llm.Usage } // nil: the LLM layer is off
+	LLM          interface{ Budget() llm.Budget } // nil: the LLM layer is off
 }
 
 // Status is the GET /api/status response.
@@ -64,7 +64,7 @@ type Status struct {
 	Silences      []silence.Silence `json:"silences"`
 	DeployWindows []silence.Window  `json:"deploy_windows"`
 	Receivers     []ReceiverStatus  `json:"receivers"`
-	LLM           *llm.Usage        `json:"llm,omitempty"`
+	LLM           *llm.Budget       `json:"llm,omitempty"`
 }
 
 type ReceiverStatus struct {
@@ -137,7 +137,7 @@ func (src *Source) Status() Status {
 		st.Receivers = append(st.Receivers, ReceiverStatus{Name: r.Name(), DeliveryStats: r.Stats()})
 	}
 	if src.LLM != nil {
-		u := src.LLM.Usage()
+		u := src.LLM.Budget()
 		st.LLM = &u
 	}
 	return st

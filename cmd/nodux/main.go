@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -11,22 +12,32 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	_ "time/tzdata" // digest times in TZ=..., even in a distroless image
 
 	"github.com/skipjust12/nodux/internal/action"
+	"github.com/skipjust12/nodux/internal/chatops"
 	"github.com/skipjust12/nodux/internal/config"
 	"github.com/skipjust12/nodux/internal/detector"
+	"github.com/skipjust12/nodux/internal/digest"
 	"github.com/skipjust12/nodux/internal/dockerclient"
 	"github.com/skipjust12/nodux/internal/engine"
 	"github.com/skipjust12/nodux/internal/heartbeat"
+	"github.com/skipjust12/nodux/internal/history"
+	"github.com/skipjust12/nodux/internal/incident"
 	"github.com/skipjust12/nodux/internal/llm"
 	"github.com/skipjust12/nodux/internal/probe"
 	"github.com/skipjust12/nodux/internal/redact"
 	"github.com/skipjust12/nodux/internal/server"
 	"github.com/skipjust12/nodux/internal/silence"
+	"github.com/skipjust12/nodux/internal/state"
+	"github.com/skipjust12/nodux/internal/tools"
 )
 
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
 var version = "dev"
+
+// How often memory use is recorded for the digest's growth section.
+const sampleInterval = 5 * time.Minute
 
 func main() {
 	if len(os.Args) > 1 {
@@ -37,6 +48,7 @@ func main() {
 
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	printDigest := flag.Bool("digest", false, "print the digest of the last period (digest.every) from the alert history and exit")
 	flag.Usage = usage
 	flag.Parse()
 	if flag.NArg() > 0 {
@@ -60,120 +72,75 @@ func main() {
 	}
 	level.Set(cfg.SlogLevel())
 
-	st, err := build(cfg)
+	if *printDigest {
+		text, err := digestNow(context.Background(), cfg, time.Now())
+		if err != nil {
+			slog.Error("failed to build the digest", "error", err)
+			os.Exit(1)
+		}
+		fmt.Println(text)
+		return
+	}
+
+	a, err := build(cfg)
 	if err != nil {
 		slog.Error("failed to set up", "error", err)
 		os.Exit(1)
 	}
-	eng := engine.New(dockerclient.New(cfg.Docker.SocketPath), st.opts)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	src := &server.Source{
-		Engine:       eng,
-		Version:      version,
-		Hostname:     cfg.Hostname,
-		Started:      time.Now(),
-		PollInterval: cfg.PollInterval(),
-		Silences:     st.opts.Silences,
+	if err := a.listen(cfg); err != nil {
+		slog.Error("failed to set up", "error", err)
+		os.Exit(1)
 	}
-	for _, r := range st.receivers {
-		src.Receivers = append(src.Receivers, r)
-	}
-	if st.llm != nil {
-		src.LLM = st.llm
-	}
-
-	var wg sync.WaitGroup
-	serve := func(what string, ln net.Listener, control bool) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := server.Serve(ctx, ln, server.Handler(src, control)); err != nil {
-				slog.Error(what+" server failed", "error", err)
-			}
-		}()
-	}
-	controlSocket := ""
-	if path := cfg.Server.SocketPath; path != "" {
-		if ln, err := server.ListenUnix(path); err != nil {
-			// Not fatal: monitoring matters more than the CLI.
-			slog.Warn("control socket disabled: nodux status and nodux silence won't work", "path", path, "error", err)
-		} else {
-			controlSocket = path
-			serve("control", ln, true)
-		}
-	}
-	if addr := cfg.Server.Listen; addr != "" {
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			slog.Error("failed to listen for /metrics", "listen", addr, "error", err)
-			os.Exit(1)
-		}
-		serve("metrics", ln, false)
-	}
-
-	names := make([]string, len(st.receivers))
-	for i, r := range st.receivers {
-		names[i] = r.Name()
+	receivers := make([]string, len(a.receivers))
+	for i, r := range a.receivers {
+		receivers[i] = r.Name()
 	}
 	slog.Info("nodux starting",
 		"version", version,
 		"host", cfg.Hostname,
 		"socket", cfg.Docker.SocketPath,
 		"poll_interval", cfg.PollInterval().String(),
-		"detectors", enabledNames(st.opts),
+		"detectors", enabledNames(a.opts),
 		"probes", len(cfg.Probes.Targets),
-		"receivers", names,
+		"state_dir", cfg.StateDir,
+		"incidents", cfg.Incidents.Enabled,
+		"receivers", receivers,
 		"heartbeat", cfg.Heartbeat.Enabled,
 		"llm", cfg.LLM.Enabled,
-		"control_socket", controlSocket,
+		"digest", cfg.Digest.Enabled,
+		"telegram", cfg.ChatOps.Telegram.Enabled,
+		"control_socket", a.controlSocket,
 		"metrics", cfg.Server.Listen,
 	)
 
-	if hb := cfg.Heartbeat; hb.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			heartbeat.New(hb.URL, hb.Interval(), eng.Healthy).Run(ctx)
-		}()
-	}
-
-	eng.Run(ctx)
-	wg.Wait()
-
-	// Give queued alerts a chance to go out before exiting.
-	closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	var closing sync.WaitGroup
-	for _, r := range st.receivers {
-		closing.Add(1)
-		go func() {
-			defer closing.Done()
-			if err := r.Close(closeCtx); err != nil {
-				slog.Error("receiver shutdown", "receiver", r.Name(), "error", err)
-			}
-		}()
-	}
-	closing.Wait()
-	cancel()
-
+	a.run(ctx, cfg)
 	slog.Info("nodux stopped")
 }
 
-// setup is what the config turns into.
-type setup struct {
-	opts engine.Options
+// app is everything main wires together.
+type app struct {
+	opts   engine.Options
+	engine *engine.Engine
 	// receivers are drained on shutdown and reported in /metrics.
 	receivers []*action.HTTPAction
+	history   *history.Store
 	llm       *llm.Anthropic
+	toolbox   *tools.Toolbox
+
+	// Set by listen: the control socket (status, silences) and the
+	// /metrics listener, each nil if off.
+	control, metrics net.Listener
+	controlSocket    string
 }
 
-// build turns the config into engine options and the pieces around
-// them.
-func build(cfg *config.Config) (*setup, error) {
+// build turns the config into a ready-to-run app.
+func build(cfg *config.Config) (*app, error) {
+	a := &app{}
 	d := cfg.Detectors
-	st := &setup{}
 	opts := engine.Options{
 		Hostname:          cfg.Hostname,
 		PollInterval:      cfg.PollInterval(),
@@ -184,6 +151,9 @@ func build(cfg *config.Config) (*setup, error) {
 		CollectThrottling: d.CPUThrottle.Enabled,
 		Silences:          silence.New(),
 		DeployGrace:       cfg.Silences.DeployGrace(),
+	}
+	if in := cfg.Incidents; in.Enabled {
+		opts.Grouping = incident.Config{Enabled: true, GroupWait: in.GroupWait(), Window: in.Window()}
 	}
 
 	if d.CrashLoop.Enabled {
@@ -210,7 +180,9 @@ func build(cfg *config.Config) (*setup, error) {
 	if d.Exit.Enabled {
 		opts.EventDetectors = append(opts.EventDetectors, detector.NewExitDetector(d.Exit.IgnoreExitCodes, d.OOM.Enabled))
 	}
-	if d.Expected.Enabled && len(d.Expected.Containers) > 0 {
+	if d.Expected.Enabled {
+		// Even with no names configured: containers can ask to be
+		// expected with the nodux.expected=true label.
 		opts.Expected = detector.NewExpectedDetector(d.Expected.Containers, d.Expected.Grace())
 	}
 
@@ -274,10 +246,23 @@ func build(cfg *config.Config) (*setup, error) {
 	}
 	opts.Redactor = red
 
+	if cfg.StateDir != "" {
+		st, err := state.Open(cfg.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("%w (set state_dir to a writable directory, or to \"\" to keep state in memory)", err)
+		}
+		hist, err := history.Open(cfg.StateDir)
+		if err != nil {
+			return nil, err
+		}
+		opts.State, opts.History, opts.SampleInterval = st, hist, sampleInterval
+		a.history = hist
+	}
+
 	opts.Actions = []action.Action{action.NewConsole()}
-	add := func(a *action.HTTPAction, r action.Route) {
-		st.receivers = append(st.receivers, a)
-		opts.Actions = append(opts.Actions, action.NewRouted(a, r))
+	add := func(r *action.HTTPAction, route action.Route) {
+		a.receivers = append(a.receivers, r)
+		opts.Actions = append(opts.Actions, action.NewRouted(r, route))
 	}
 	if wh := cfg.Actions.Webhook; wh.Enabled {
 		add(action.NewWebhook(action.WebhookConfig{
@@ -285,44 +270,244 @@ func build(cfg *config.Config) (*setup, error) {
 			Format:  wh.Format,
 			Headers: wh.Headers,
 			Timeout: wh.Timeout(),
-		}), action.Route{SendResolved: true})
+		}), action.Route{SendResolved: true, Digest: true})
 	}
 	for _, rc := range cfg.Actions.Receivers {
-		route := action.Route{Severities: rc.Severities, Detectors: rc.Detectors, SendResolved: rc.Resolved()}
-		var a *action.HTTPAction
+		route := action.Route{Severities: rc.Severities, Detectors: rc.Detectors, SendResolved: rc.Resolved(), Digest: rc.Digests()}
+		var r *action.HTTPAction
 		switch rc.Type {
 		case "webhook":
-			a = action.NewWebhook(action.WebhookConfig{Name: rc.Name, URL: rc.URL, Format: rc.Format, Headers: rc.Headers, Timeout: rc.Timeout()})
+			r = action.NewWebhook(action.WebhookConfig{Name: rc.Name, URL: rc.URL, Format: rc.Format, Headers: rc.Headers, Timeout: rc.Timeout()})
 		case "telegram":
-			a = action.NewTelegram(action.TelegramConfig{Name: rc.Name, BotToken: rc.BotToken, ChatID: rc.ChatID, ThreadID: rc.ThreadID, APIURL: rc.APIURL, Timeout: rc.Timeout()})
+			r = action.NewTelegram(action.TelegramConfig{Name: rc.Name, BotToken: rc.BotToken, ChatID: rc.ChatID, ThreadID: rc.ThreadID, APIURL: rc.APIURL, Timeout: rc.Timeout()})
 		case "ntfy":
-			if a, err = action.NewNtfy(action.NtfyConfig{Name: rc.Name, URL: rc.URL, Token: rc.Token, Timeout: rc.Timeout()}); err != nil {
-				st.close()
+			if r, err = action.NewNtfy(action.NtfyConfig{Name: rc.Name, URL: rc.URL, Token: rc.Token, Timeout: rc.Timeout()}); err != nil {
+				a.close()
 				return nil, fmt.Errorf("receiver %s: %w", rc.Name, err)
 			}
 		}
-		add(a, route)
+		add(r, route)
 	}
 
+	docker := dockerclient.New(cfg.Docker.SocketPath)
+	// The toolbox and the engine need each other: the model can ask
+	// what's open right now. eng is set before anything runs.
+	var eng *engine.Engine
+	openAlerts := func() []detector.Issue { return eng.ActiveAlerts() }
+	diskPaths := h.Disk.Paths
+	if !h.Disk.Enabled {
+		diskPaths = nil
+	}
+	a.toolbox = tools.New(tools.Config{
+		Docker:     docker,
+		History:    a.history,
+		Redactor:   red,
+		ProcPath:   h.ProcPath,
+		DiskPaths:  diskPaths,
+		Exclude:    cfg.ExcludeContainers,
+		OpenAlerts: openAlerts,
+	})
+
 	if l := cfg.LLM; l.Enabled {
-		st.llm = llm.NewAnthropic(llm.AnthropicConfig{
+		var onUsage func(llm.Usage)
+		if hist := a.history; hist != nil {
+			onUsage = func(u llm.Usage) {
+				err := hist.AddLLMCall(context.Background(), history.LLMCall{
+					Run: u.Run, Purpose: u.Purpose, Model: u.Model,
+					Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite,
+				})
+				if err != nil {
+					slog.Warn("recording LLM usage failed", "error", err)
+				}
+			}
+		}
+		a.llm = llm.NewAnthropic(llm.AnthropicConfig{
 			APIKey:     l.APIKey,
 			Model:      l.Model,
 			BaseURL:    l.BaseURL,
+			Effort:     l.Effort,
 			Timeout:    l.Timeout(),
 			MaxPerHour: l.MaxPerHour,
+			Toolbox:    a.toolbox,
+			MaxSteps:   l.MaxSteps,
+			Host:       cfg.Hostname,
+			OnUsage:    onUsage,
 		})
-		opts.Classifier = st.llm
+		opts.Analyzer = a.llm
 	}
 
-	st.opts = opts
-	return st, nil
+	eng = engine.New(docker, opts)
+	a.opts, a.engine = opts, eng
+	return a, nil
 }
 
-// close drops the receivers' queues; for setups that never ran.
-func (st *setup) close() {
-	for _, r := range st.receivers {
+// close drops what build opened; for an app that never ran.
+func (a *app) close() {
+	for _, r := range a.receivers {
 		r.Close(context.Background())
+	}
+	if a.history != nil {
+		a.history.Close()
+	}
+}
+
+// listen opens the control socket and the /metrics listener. A control
+// socket that can't be created only costs the CLI, so it's a warning; a
+// metrics address that can't be bound is a config error.
+func (a *app) listen(cfg *config.Config) error {
+	if path := cfg.Server.SocketPath; path != "" {
+		ln, err := server.ListenUnix(path)
+		if err != nil {
+			slog.Warn("control socket disabled: nodux status and nodux silence won't work", "path", path, "error", err)
+		} else {
+			a.control, a.controlSocket = ln, path
+		}
+	}
+	if addr := cfg.Server.Listen; addr != "" {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("server.listen: %w", err)
+		}
+		a.metrics = ln
+	}
+	return nil
+}
+
+// run starts everything and blocks until ctx is cancelled and every
+// part has shut down.
+func (a *app) run(ctx context.Context, cfg *config.Config) {
+	var wg sync.WaitGroup
+	goRun := func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f()
+		}()
+	}
+
+	if a.control != nil || a.metrics != nil {
+		src := &server.Source{
+			Engine:       a.engine,
+			Version:      version,
+			Hostname:     cfg.Hostname,
+			Started:      time.Now(),
+			PollInterval: cfg.PollInterval(),
+			Silences:     a.opts.Silences,
+		}
+		for _, r := range a.receivers {
+			src.Receivers = append(src.Receivers, r)
+		}
+		if a.llm != nil { // not a typed nil in the interface
+			src.LLM = a.llm
+		}
+		serve := func(what string, ln net.Listener, control bool) {
+			goRun(func() {
+				if err := server.Serve(ctx, ln, server.Handler(src, control)); err != nil {
+					slog.Error(what+" server failed", "error", err)
+				}
+			})
+		}
+		if a.control != nil {
+			serve("control", a.control, true)
+		}
+		if a.metrics != nil {
+			serve("metrics", a.metrics, false)
+		}
+	}
+	if hb := cfg.Heartbeat; hb.Enabled {
+		goRun(func() { heartbeat.New(hb.URL, hb.Interval(), a.engine.Healthy).Run(ctx) })
+	}
+	if a.history != nil {
+		goRun(func() { maintainHistory(ctx, a.history, cfg.History.Retention()) })
+	}
+	if d := cfg.Digest; d.Enabled {
+		sched, _ := digest.ParseSchedule(d.Every, d.At, d.Weekday) // validated in config.Load
+		b := &digest.Builder{History: a.history, OpenAlerts: a.engine.ActiveAlerts, Host: cfg.Hostname}
+		if a.llm != nil {
+			b.Summarizer = a.llm
+		}
+		goRun(func() { digest.Run(ctx, sched, b, a.opts.Actions) })
+	}
+	if tg := cfg.ChatOps.Telegram; tg.Enabled {
+		botCfg := chatops.Config{
+			Token:        tg.Token,
+			AllowedChats: tg.AllowedChatIDs,
+			Tools:        a.toolbox,
+			OpenAlerts:   a.engine.ActiveAlerts,
+			Host:         cfg.Hostname,
+		}
+		if a.llm != nil { // not a typed nil in the interface
+			botCfg.Answerer = a.llm
+		}
+		bot := chatops.New(botCfg)
+		goRun(func() { bot.Run(ctx) })
+	}
+
+	a.engine.Run(ctx)
+	wg.Wait()
+
+	// Give queued alerts a chance to go out before exiting.
+	closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	var closing sync.WaitGroup
+	for _, r := range a.receivers {
+		closing.Add(1)
+		go func() {
+			defer closing.Done()
+			if err := r.Close(closeCtx); err != nil {
+				slog.Error("receiver shutdown", "receiver", r.Name(), "error", err)
+			}
+		}()
+	}
+	closing.Wait()
+	cancel()
+	if a.history != nil {
+		a.history.Close()
+	}
+}
+
+// digestNow builds the digest that would go out at now, for a look at
+// it without waiting for the schedule. Open alerts aren't in it: they
+// live in the running daemon.
+func digestNow(ctx context.Context, cfg *config.Config, now time.Time) (string, error) {
+	if cfg.StateDir == "" {
+		return "", errors.New("the digest is built from the alert history: set state_dir")
+	}
+	sched, err := digest.ParseSchedule(cfg.Digest.Every, cfg.Digest.At, cfg.Digest.Weekday)
+	if err != nil {
+		return "", fmt.Errorf("digest: %w", err)
+	}
+	hist, err := history.Open(cfg.StateDir)
+	if err != nil {
+		return "", err
+	}
+	defer hist.Close()
+	b := &digest.Builder{History: hist, Host: cfg.Hostname}
+	if l := cfg.LLM; l.Enabled {
+		b.Summarizer = llm.NewAnthropic(llm.AnthropicConfig{
+			APIKey: l.APIKey, Model: l.Model, BaseURL: l.BaseURL, Effort: l.Effort, Timeout: l.Timeout(), Host: cfg.Hostname,
+		})
+	}
+	from, to := sched.Period(now)
+	d, err := b.Build(ctx, sched.Title(), from, to)
+	if err != nil {
+		return "", err
+	}
+	return d.Text, nil
+}
+
+// maintainHistory drops old rows at startup and then once a day.
+func maintainHistory(ctx context.Context, h *history.Store, retention time.Duration) {
+	for {
+		if err := h.Prune(ctx, retention); err != nil && ctx.Err() == nil {
+			slog.Warn("pruning alert history failed", "error", err)
+		}
+		t := time.NewTimer(24 * time.Hour)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
 	}
 }
 

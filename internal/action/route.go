@@ -16,10 +16,13 @@ type Route struct {
 	Detectors []string
 	// SendResolved sends "resolved" messages too.
 	SendResolved bool
+	// Digest sends the periodic digest too.
+	Digest bool
 }
 
-// Routed is a receiver behind a Route. Silenced alerts never get
-// through.
+// Routed is a receiver behind a Route: it gets the alerts of each
+// notification that the route lets through, and nothing if none are
+// left. Silenced alerts never get through.
 type Routed struct {
 	Action
 	route Route
@@ -27,11 +30,28 @@ type Routed struct {
 
 func NewRouted(a Action, r Route) *Routed { return &Routed{Action: a, route: r} }
 
-func (r *Routed) Run(ctx context.Context, issue detector.Issue) error {
-	if !r.route.Matches(issue) {
+func (r *Routed) Send(ctx context.Context, n Notification) error {
+	if n.Digest != nil {
+		if !r.route.Digest {
+			return nil
+		}
+		return r.Action.Send(ctx, n)
+	}
+	var kept []detector.Issue
+	for _, issue := range n.Alerts {
+		if r.route.Matches(issue) {
+			kept = append(kept, issue)
+		}
+	}
+	if len(kept) == 0 {
 		return nil
 	}
-	return r.Action.Run(ctx, issue)
+	n.Alerts = kept
+	if !firing(kept) {
+		// Only resolutions are left; the analysis was about the alerts.
+		n.Summary = ""
+	}
+	return r.Action.Send(ctx, n)
 }
 
 // Matches reports whether the route lets the issue through.

@@ -2,6 +2,7 @@ package detector
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,9 @@ type DiskUsage struct {
 	Used, Avail             uint64 // bytes; Avail is what non-root can still write
 	InodesUsed, InodesTotal uint64 // InodesTotal 0 = fs without fixed inodes (btrfs)
 }
+
+// Statfs reports a filesystem's usage.
+func Statfs(path string) (DiskUsage, error) { return statfs(path) }
 
 // DiskDetector fires when a filesystem is at or above threshold percent
 // full, by space or by inodes, whichever is worse. Percent is computed
@@ -79,6 +83,31 @@ func (d *DiskDetector) Check() []*Issue {
 	return issues
 }
 
+// SaveState keeps which paths are over the threshold, so a restart
+// doesn't resolve them while they sit in the hysteresis gap.
+func (d *DiskDetector) SaveState() ([]byte, error) {
+	var firing []string
+	for _, p := range d.paths {
+		if d.gates[p].firing {
+			firing = append(firing, p)
+		}
+	}
+	return json.Marshal(firing)
+}
+
+func (d *DiskDetector) LoadState(data []byte) error {
+	var firing []string
+	if err := json.Unmarshal(data, &firing); err != nil {
+		return err
+	}
+	for _, p := range firing {
+		if g, ok := d.gates[p]; ok {
+			g.firing = true
+		}
+	}
+	return nil
+}
+
 // HostMemoryDetector fires when the host's memory in use (MemTotal -
 // MemAvailable, i.e. not counting reclaimable cache) stays at or above
 // threshold percent for sustain.
@@ -127,6 +156,16 @@ func (d *HostMemoryDetector) Check() []*Issue {
 		DetectedAt: d.now(),
 	}}
 }
+
+func (d *HostMemoryDetector) SaveState() ([]byte, error) { return json.Marshal(d.gate.firing) }
+
+func (d *HostMemoryDetector) LoadState(data []byte) error {
+	return json.Unmarshal(data, &d.gate.firing)
+}
+
+// ReadMeminfo returns MemTotal and MemAvailable in bytes from a
+// /proc/meminfo-style file.
+func ReadMeminfo(path string) (total, avail uint64, err error) { return readMeminfo(path) }
 
 // readMeminfo returns MemTotal and MemAvailable in bytes.
 func readMeminfo(path string) (total, avail uint64, err error) {
@@ -229,6 +268,26 @@ func (d *CPUDetector) issue(pct float64) *Issue {
 		Resource:   "cpu",
 		DetectedAt: d.now(),
 	}
+}
+
+type cpuSaved struct {
+	Firing  bool    `json:"firing"`
+	LastPct float64 `json:"last_pct,omitempty"`
+}
+
+// SaveState keeps whether the CPU alert is firing. The jiffy counters
+// aren't saved: an average over the time nodux was down means nothing.
+func (d *CPUDetector) SaveState() ([]byte, error) {
+	return json.Marshal(cpuSaved{Firing: d.gate.firing, LastPct: d.lastPct})
+}
+
+func (d *CPUDetector) LoadState(data []byte) error {
+	var saved cpuSaved
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return err
+	}
+	d.gate.firing, d.lastPct = saved.Firing, saved.LastPct
+	return nil
 }
 
 // readCPUStat returns cumulative busy and total jiffies across all CPUs

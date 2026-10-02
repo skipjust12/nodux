@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -19,6 +20,9 @@ import (
 // open until the container has run for a full window without a restart,
 // and then lets the engine send the resolution. A container that gave
 // up (restart policy exhausted, status exited) stays in the episode.
+//
+// nodux.crashloop.threshold and nodux.crashloop.window override the
+// defaults per container.
 type CrashLoopDetector struct {
 	threshold int
 	window    time.Duration
@@ -32,8 +36,10 @@ type CrashLoopDetector struct {
 }
 
 type crashLoopState struct {
-	restarts []time.Time
-	firing   bool
+	Restarts  []time.Time   `json:"restarts,omitempty"`
+	Firing    bool          `json:"firing,omitempty"`
+	Threshold int           `json:"threshold"`
+	Window    time.Duration `json:"window"`
 }
 
 func NewCrashLoopDetector(threshold int, window time.Duration) *CrashLoopDetector {
@@ -71,18 +77,29 @@ func (d *CrashLoopDetector) HandleEvent(ev ContainerEvent) *Issue {
 		}
 		st := d.state[ev.ID]
 		if st == nil {
-			st = &crashLoopState{}
+			st = d.newState(ev.Labels)
 			d.state[ev.ID] = st
 		}
-		st.restarts = append(st.restarts, ev.Time)
-		st.prune(ev.Time.Add(-d.window))
-		if st.firing || len(st.restarts) < d.threshold {
+		st.Restarts = append(st.Restarts, ev.Time)
+		st.prune(ev.Time.Add(-st.Window))
+		if st.Firing || len(st.Restarts) < st.Threshold {
 			return nil
 		}
-		st.firing = true
-		return d.issue(ContainerSnapshot{ID: ev.ID, Name: ev.Name, ExitCode: exitCode}, len(st.restarts), ev.Time)
+		st.Firing = true
+		return d.issue(ContainerSnapshot{ID: ev.ID, Name: ev.Name, ExitCode: exitCode, Labels: ev.Labels}, st, len(st.Restarts), ev.Time)
 	}
 	return nil
+}
+
+func (d *CrashLoopDetector) newState(labels map[string]string) *crashLoopState {
+	st := &crashLoopState{Threshold: d.threshold, Window: d.window}
+	if n, ok := labelPositiveInt(labels, "nodux.crashloop.threshold"); ok {
+		st.Threshold = n
+	}
+	if w, ok := labelDuration(labels, "nodux.crashloop.window"); ok && w > 0 {
+		st.Window = w
+	}
+	return st
 }
 
 func (d *CrashLoopDetector) Check(s ContainerSnapshot) *Issue {
@@ -94,26 +111,26 @@ func (d *CrashLoopDetector) Check(s ContainerSnapshot) *Issue {
 		return nil
 	}
 	now := d.now()
-	st.prune(now.Add(-d.window))
+	st.prune(now.Add(-st.Window))
 
-	if !st.firing {
-		if len(st.restarts) < d.threshold {
-			if len(st.restarts) == 0 {
+	if !st.Firing {
+		if len(st.Restarts) < st.Threshold {
+			if len(st.Restarts) == 0 {
 				delete(d.state, s.ID)
 			}
 			return nil
 		}
-		st.firing = true
+		st.Firing = true
 	}
-	if len(st.restarts) == 0 && s.Status == "running" {
+	if len(st.Restarts) == 0 && s.Status == "running" {
 		delete(d.state, s.ID)
 		return nil
 	}
-	return d.issue(s, len(st.restarts), now)
+	return d.issue(s, st, len(st.Restarts), now)
 }
 
-func (d *CrashLoopDetector) issue(s ContainerSnapshot, restarts int, at time.Time) *Issue {
-	msg := fmt.Sprintf("container restarted %d times in the last %s after crashing", restarts, d.window)
+func (d *CrashLoopDetector) issue(s ContainerSnapshot, st *crashLoopState, restarts int, at time.Time) *Issue {
+	msg := fmt.Sprintf("container restarted %d times in the last %s after crashing", restarts, st.Window)
 	if restarts == 0 {
 		msg = fmt.Sprintf("container stopped after crash-looping (status: %s)", s.Status)
 	}
@@ -127,13 +144,13 @@ func (d *CrashLoopDetector) issue(s ContainerSnapshot, restarts int, at time.Tim
 }
 
 func (st *crashLoopState) prune(cutoff time.Time) {
-	kept := st.restarts[:0]
-	for _, t := range st.restarts {
+	kept := st.Restarts[:0]
+	for _, t := range st.Restarts {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
-	st.restarts = kept
+	st.Restarts = kept
 }
 
 func (d *CrashLoopDetector) Forget(containerID string) {
@@ -146,4 +163,38 @@ func (d *CrashLoopDetector) forget(id string) {
 	delete(d.state, id)
 	delete(d.crashed, id)
 	delete(d.stops, id)
+}
+
+type crashLoopSaved struct {
+	Stops   map[string]bool            `json:"stops,omitempty"`
+	Crashed map[string]int             `json:"crashed,omitempty"`
+	State   map[string]*crashLoopState `json:"state,omitempty"`
+}
+
+func (d *CrashLoopDetector) SaveState() ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return json.Marshal(crashLoopSaved{Stops: d.stops, Crashed: d.crashed, State: d.state})
+}
+
+func (d *CrashLoopDetector) LoadState(data []byte) error {
+	var saved crashLoopSaved
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, v := range saved.Stops {
+		d.stops[id] = v
+	}
+	for id, v := range saved.Crashed {
+		d.crashed[id] = v
+	}
+	for id, st := range saved.State {
+		if st == nil || st.Threshold <= 0 || st.Window <= 0 {
+			continue
+		}
+		d.state[id] = st
+	}
+	return nil
 }

@@ -41,10 +41,10 @@ func TestTelegram(t *testing.T) {
 	issue.Host = "vps1"
 	issue.Container.Name = "api<1>"
 	issue.Logs = []string{"a < b & c"}
-	tg.Run(context.Background(), issue)
+	tg.Send(context.Background(), one(issue))
 	resolved := issue
 	resolved.Resolved = true
-	tg.Run(context.Background(), resolved)
+	tg.Send(context.Background(), one(resolved))
 	closeAndWait(t, tg)
 
 	r := <-got
@@ -74,7 +74,7 @@ func TestTelegram_LongMessageFits(t *testing.T) {
 	issue := testIssue()
 	issue.Message = strings.Repeat("<", 3000)
 	issue.Logs = []string{strings.Repeat("x", 300), strings.Repeat("y", 300)}
-	text := telegramText(issue)
+	text := telegramText(one(issue))
 	if len(text) > telegramMaxMessage {
 		t.Fatalf("%d bytes", len(text))
 	}
@@ -91,11 +91,11 @@ func TestNtfy(t *testing.T) {
 	}
 	issue := testIssue()
 	issue.Analysis = "Heap grows."
-	n.Run(context.Background(), issue)
+	n.Send(context.Background(), one(issue))
 	warn := issue
 	warn.Severity = detector.SeverityWarning
 	warn.Resolved = true
-	n.Run(context.Background(), warn)
+	n.Send(context.Background(), one(warn))
 	closeAndWait(t, n)
 
 	r := <-got
@@ -123,11 +123,17 @@ func TestNtfy(t *testing.T) {
 	}
 }
 
-type sink struct{ got []detector.Issue }
+type sink struct {
+	got     []detector.Issue
+	digests int
+}
 
 func (s *sink) Name() string { return "sink" }
-func (s *sink) Run(_ context.Context, issue detector.Issue) error {
-	s.got = append(s.got, issue)
+func (s *sink) Send(_ context.Context, n Notification) error {
+	s.got = append(s.got, n.Alerts...)
+	if n.Digest != nil {
+		s.digests++
+	}
 	return nil
 }
 
@@ -153,7 +159,7 @@ func TestRouted(t *testing.T) {
 		s := &sink{}
 		r := NewRouted(s, tt.route)
 		for _, i := range []detector.Issue{crit, warn, resolved, silenced, host} {
-			r.Run(context.Background(), i)
+			r.Send(context.Background(), one(i))
 		}
 		var names []string
 		for _, i := range s.got {
@@ -179,9 +185,70 @@ func TestRecord_Silenced(t *testing.T) {
 func TestHTTPAction_FailureAndDropCounts(t *testing.T) {
 	srv, _ := capture(t, http.StatusBadRequest)
 	w := newWebhook(t, WebhookConfig{URL: srv.URL})
-	w.Run(context.Background(), testIssue())
+	w.Send(context.Background(), one(testIssue()))
 	closeAndWait(t, w)
 	if s := w.Stats(); s.Failed != 1 || s.Sent != 0 {
 		t.Errorf("stats = %+v", s)
+	}
+}
+
+func TestRouted_FiltersBatchesAndDigests(t *testing.T) {
+	s := &sink{}
+	r := NewRouted(s, Route{Severities: []string{"critical"}, SendResolved: true})
+	b := batch() // a critical oom, a warning, and a resolution without a severity
+	r.Send(context.Background(), b)
+	if len(s.got) != 1 || s.got[0].Detector != "oom" {
+		t.Fatalf("got %+v", s.got)
+	}
+	r.Send(context.Background(), Notification{Digest: &Digest{Title: "Daily digest"}})
+	if s.digests != 0 {
+		t.Fatal("digest sent to a receiver that didn't ask for it")
+	}
+	NewRouted(s, Route{Digest: true}).Send(context.Background(), Notification{Digest: &Digest{Title: "Daily digest"}})
+	if s.digests != 1 {
+		t.Fatal("digest not sent")
+	}
+}
+
+func TestTelegram_BatchAndDigest(t *testing.T) {
+	text := telegramText(batch())
+	for _, want := range []string{
+		"<b>[CRITICAL] incident #4</b> (update) on vps1: 2 new, 1 resolved",
+		"<blockquote>api leaks memory</blockquote>",
+		"\n• <b>oom</b> <code>api</code>: container was killed",
+		"\n• resolved <b>unhealthy</b> <code>worker</code>: resolved after 3m",
+		"<pre>l1\nl2",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+	d := telegramText(Notification{Digest: &Digest{Text: "*nodux daily digest* for vps1\n*Alerts:* 3 in `api` <x>"}})
+	if d != "<b>nodux daily digest</b> for vps1\n<b>Alerts:</b> 3 in <code>api</code> &lt;x&gt;" {
+		t.Errorf("digest = %q", d)
+	}
+
+	// A huge batch is cut at a line, never inside a tag.
+	n := batch()
+	for i := 0; i < 60; i++ {
+		n.Alerts = append(n.Alerts, detector.Issue{Detector: "exit", Severity: "warning", Container: detector.ContainerSnapshot{Name: "c"}, Message: strings.Repeat("<m>", 100)})
+	}
+	text = telegramText(n)
+	if len(text) > telegramMaxMessage || strings.Count(text, "<b>") != strings.Count(text, "</b>") || strings.Count(text, "<code>") != strings.Count(text, "</code>") {
+		t.Errorf("%d bytes, unbalanced tags:\n%s", len(text), text)
+	}
+}
+
+func TestNtfy_Batch(t *testing.T) {
+	m := ntfyMessage("alerts", batch())
+	if m.Title != "[CRITICAL] incident #4 (update) on vps1" || m.Priority != 5 {
+		t.Errorf("title %q, priority %d", m.Title, m.Priority)
+	}
+	if !strings.Contains(m.Message, "2 new, 1 resolved\n\napi leaks memory\n\n• oom api: container was killed") {
+		t.Errorf("message = %q", m.Message)
+	}
+	d := ntfyMessage("alerts", Notification{Digest: &Digest{Title: "Daily digest", Host: "vps1", Text: "body"}})
+	if d.Title != "Daily digest for vps1" || d.Priority != 2 || d.Message != "body" {
+		t.Errorf("digest = %+v", d)
 	}
 }

@@ -64,7 +64,7 @@ func (d *UnhealthyDetector) HandleEvent(ev ContainerEvent) *Issue {
 	return d.Check(ContainerSnapshot{
 		ID:           ev.ID,
 		Name:         ev.Name,
-		Project:      ev.Project,
+		Labels:       ev.Labels,
 		Status:       "running",
 		HealthStatus: "unhealthy",
 	})

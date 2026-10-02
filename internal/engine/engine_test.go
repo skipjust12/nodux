@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skipjust12/nodux/internal/action"
 	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/dockerclient"
 	"github.com/skipjust12/nodux/internal/dockertest"
+	"github.com/skipjust12/nodux/internal/llm"
 	"github.com/skipjust12/nodux/internal/redact"
 	"github.com/skipjust12/nodux/internal/silence"
 )
@@ -24,8 +26,10 @@ type recorder struct {
 
 func (r *recorder) Name() string { return "recorder" }
 
-func (r *recorder) Run(_ context.Context, issue detector.Issue) error {
-	r.issues <- issue
+func (r *recorder) Send(_ context.Context, n action.Notification) error {
+	for _, issue := range n.Alerts {
+		r.issues <- issue
+	}
 	return nil
 }
 
@@ -469,12 +473,12 @@ func TestEngine_ExpectedContainers(t *testing.T) {
 	rec.none(t, 100*time.Millisecond)
 }
 
-type fakeClassifier struct {
-	seen chan detector.Issue
+type fakeAnalyzer struct {
+	seen chan llm.Incident
 }
 
-func (f *fakeClassifier) Classify(_ context.Context, issue detector.Issue) (string, error) {
-	f.seen <- issue
+func (f *fakeAnalyzer) Analyze(_ context.Context, inc llm.Incident) (string, error) {
+	f.seen <- inc
 	return "the database is down", nil
 }
 
@@ -487,16 +491,16 @@ func TestEngine_RedactsBeforeClassifyingAndSending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cls := &fakeClassifier{seen: make(chan detector.Issue, 4)}
+	cls := &fakeAnalyzer{seen: make(chan llm.Incident, 4)}
 	rec := start(t, srv, Options{
 		EventDetectors: []detector.EventDetector{detector.NewExitDetector([]int{0}, true)},
 		Redactor:       red,
-		Classifier:     cls,
+		Analyzer:       cls,
 	})
 
 	stream <- event("w1", "worker", "die", map[string]string{"exitCode": "1"}, time.Now())
 	issue := rec.next(t)
-	classified := <-cls.seen
+	classified := (<-cls.seen).Alerts[0]
 
 	for _, is := range []detector.Issue{issue, classified} {
 		if len(is.Logs) != 2 || is.Logs[0] != "connecting with password=[REDACTED]" {
@@ -584,7 +588,7 @@ func TestEngine_StaleObservationDoesNotCloseNewerEpisode(t *testing.T) {
 func TestEngine_CPUThrottling(t *testing.T) {
 	srv := dockertest.New(t)
 	limited := container("t1", "api", "running")
-	limited.HostConfig.NanoCPUs = 500_000_000
+	limited.HostConfig.NanoCpus = 500_000_000
 	srv.AddContainer(limited)
 	srv.AddContainer(container("u1", "free", "running"))
 
@@ -712,10 +716,10 @@ func TestEngine_SilenceHoldsAlertAndReleasesIt(t *testing.T) {
 func TestEngine_DeployWindowSilencesProject(t *testing.T) {
 	srv := dockertest.New(t)
 	web := container("c1", "shop-web-1", "running")
-	web.Config.Labels = map[string]string{dockerclient.ProjectLabel: "shop"}
+	web.Config.Labels = map[string]string{detector.LabelComposeProject: "shop"}
 	srv.AddContainer(web)
 	db := container("c2", "shop-db-1", "running")
-	db.Config.Labels = map[string]string{dockerclient.ProjectLabel: "shop"}
+	db.Config.Labels = map[string]string{detector.LabelComposeProject: "shop"}
 	srv.AddContainer(db)
 	stream := srv.NewStream()
 
@@ -729,7 +733,7 @@ func TestEngine_DeployWindowSilencesProject(t *testing.T) {
 	waitFor(t, func() bool { return !eng.LastPoll().IsZero() })
 
 	// compose up recreates the web container...
-	stream <- event("c3", "shop-web-1", "create", map[string]string{dockerclient.ProjectLabel: "shop"}, time.Now())
+	stream <- event("c3", "shop-web-1", "create", map[string]string{detector.LabelComposeProject: "shop"}, time.Now())
 	waitFor(t, func() bool { return len(store.Windows()) == 2 })
 
 	// ...and the db goes unhealthy meanwhile: same project, silenced.
@@ -743,7 +747,7 @@ func TestEngine_DeployWindowSilencesProject(t *testing.T) {
 
 	// The new web container crashes right away: a deploy doesn't cause
 	// crashes, and a one-off alert held back would be lost, so it's sent.
-	stream <- event("c3", "shop-web-1", "die", map[string]string{"exitCode": "1", dockerclient.ProjectLabel: "shop"}, time.Now())
+	stream <- event("c3", "shop-web-1", "die", map[string]string{"exitCode": "1", detector.LabelComposeProject: "shop"}, time.Now())
 	if issue := rec.next(t); issue.Detector != "exit" || issue.Silenced {
 		t.Fatalf("a crash during a deploy must not be silenced: %+v", issue)
 	}

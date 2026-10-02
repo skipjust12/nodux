@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -166,4 +167,51 @@ func formatWindow(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dh%dm", m/60, m%60)
 	}
+}
+
+type forecastSaved struct {
+	Firing  bool            `json:"firing,omitempty"`
+	Samples []forecastPoint `json:"samples,omitempty"`
+}
+
+type forecastPoint struct {
+	At    time.Time `json:"at"`
+	Avail float64   `json:"avail"`
+}
+
+// SaveState keeps the samples and which paths are firing, so a restart
+// neither loses the fill rate nor resolves an open forecast.
+func (d *DiskForecastDetector) SaveState() ([]byte, error) {
+	out := make(map[string]forecastSaved, len(d.paths))
+	for _, p := range d.paths {
+		sv := forecastSaved{Firing: d.firing[p]}
+		for _, smp := range d.samples[p] {
+			sv.Samples = append(sv.Samples, forecastPoint{At: smp.at, Avail: smp.avail})
+		}
+		out[p] = sv
+	}
+	return json.Marshal(out)
+}
+
+func (d *DiskForecastDetector) LoadState(data []byte) error {
+	var in map[string]forecastSaved
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	cutoff := d.now().Add(-d.window)
+	for _, p := range d.paths {
+		sv, ok := in[p]
+		if !ok {
+			continue
+		}
+		d.firing[p] = sv.Firing
+		var samples []diskSample
+		for _, pt := range sv.Samples {
+			if pt.At.After(cutoff) {
+				samples = append(samples, diskSample{at: pt.At, avail: pt.Avail})
+			}
+		}
+		d.samples[p] = samples
+	}
+	return nil
 }

@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -73,12 +74,12 @@ type targetState struct {
 
 // CertInfo is the certificate in a target's chain that expires first.
 type CertInfo struct {
-	Target   string
-	Subject  string
-	Issuer   string
-	NotAfter time.Time
+	Target   string    `json:"target"`
+	Subject  string    `json:"subject"`
+	Issuer   string    `json:"issuer"`
+	NotAfter time.Time `json:"not_after"`
 	// Leaf is false when the first to expire is an intermediate.
-	Leaf bool
+	Leaf bool `json:"leaf"`
 }
 
 func New(cfg Config) *Prober {
@@ -345,4 +346,40 @@ func cleanErr(err error) error {
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+type savedTarget struct {
+	Failures int       `json:"failures,omitempty"`
+	LastErr  string    `json:"last_err,omitempty"`
+	Cert     *CertInfo `json:"cert,omitempty"`
+}
+
+// SaveState keeps each target's failure streak and last certificate, so
+// a restart neither resolves a failing probe nor forgets an expiring
+// certificate of a target that's down.
+func (p *Prober) SaveState() ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]savedTarget, len(p.state))
+	for name, st := range p.state {
+		if st.failures > 0 || st.cert != nil {
+			out[name] = savedTarget{Failures: st.failures, LastErr: st.lastErr, Cert: st.cert}
+		}
+	}
+	return json.Marshal(out)
+}
+
+func (p *Prober) LoadState(data []byte) error {
+	var in map[string]savedTarget
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for name, sv := range in {
+		if st, ok := p.state[name]; ok { // targets removed from the config are dropped
+			st.failures, st.lastErr, st.cert = sv.Failures, sv.LastErr, sv.Cert
+		}
+	}
+	return nil
 }

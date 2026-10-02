@@ -86,7 +86,7 @@ func (src *Source) metrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	if src.LLM != nil {
-		u := src.LLM.Usage()
+		u := src.LLM.Budget()
 		if u.MaxPerHour > 0 {
 			m.family("nodux_llm_budget_remaining", "gauge", "LLM calls left in the current hourly budget.")
 			m.sample("nodux_llm_budget_remaining", float64(u.Remaining))

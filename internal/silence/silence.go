@@ -9,13 +9,14 @@
 // OOM kill is reported even mid-deploy.
 //
 // Silenced alerts are still tracked and logged to stdout; they just
-// aren't sent anywhere. Silences live in memory, so a restart of nodux
-// clears them.
+// aren't sent anywhere. With a state file, silences and windows survive
+// a restart of nodux.
 package silence
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -306,4 +307,39 @@ func (st *Store) pruneLocked() {
 			delete(st.windows, k)
 		}
 	}
+}
+
+type saved struct {
+	Silences []Silence `json:"silences,omitempty"`
+	Windows  []Window  `json:"windows,omitempty"`
+}
+
+// SaveState returns the active silences and deploy windows.
+func (st *Store) SaveState() ([]byte, error) {
+	return json.Marshal(saved{Silences: st.List(), Windows: st.Windows()})
+}
+
+// LoadState restores saved silences and windows; ones that ended in the
+// meantime are dropped.
+func (st *Store) LoadState(data []byte) error {
+	var sv saved
+	if err := json.Unmarshal(data, &sv); err != nil {
+		return err
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, s := range sv.Silences {
+		if s.ID != "" && s.Matcher.Validate() == nil {
+			s := s
+			st.silences[s.ID] = &s
+		}
+	}
+	for _, w := range sv.Windows {
+		k := windowKey{w.Scope, w.Name}
+		if (w.Scope == "container" || w.Scope == "project") && w.Name != "" && w.Until.After(st.windows[k]) {
+			st.windows[k] = w.Until
+		}
+	}
+	st.pruneLocked()
+	return nil
 }

@@ -1,13 +1,8 @@
 package action
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
-	"net/http"
 	"time"
-
-	"github.com/skipjust12/nodux/internal/detector"
 )
 
 const (
@@ -27,7 +22,9 @@ type WebhookConfig struct {
 	Timeout time.Duration
 }
 
-// NewWebhook POSTs each alert to an HTTP endpoint as JSON.
+// NewWebhook POSTs notifications to an HTTP endpoint. In json format
+// each alert is its own POST (the Record, as on the console); in slack
+// format each notification is one message.
 func NewWebhook(cfg WebhookConfig) *HTTPAction {
 	if cfg.Format == "" {
 		cfg.Format = FormatJSON
@@ -35,25 +32,32 @@ func NewWebhook(cfg WebhookConfig) *HTTPAction {
 	if cfg.Name == "" {
 		cfg.Name = "webhook"
 	}
-	return newHTTPAction(cfg.Name, cfg.URL, cfg.Timeout, func(ctx context.Context, issue detector.Issue) (*http.Request, error) {
-		var body []byte
-		var err error
-		if cfg.Format == FormatSlack {
-			body, err = json.Marshal(map[string]string{"text": slackText(issue)})
-		} else {
-			body, err = json.Marshal(NewRecord(issue))
-		}
-		if err != nil {
-			return nil, err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		for k, v := range cfg.Headers {
-			req.Header.Set(k, v)
-		}
-		return req, nil
+	return newHTTPAction(cfg.Name, cfg.URL, cfg.Headers, cfg.Timeout, func(n Notification) ([][]byte, error) {
+		return webhookPayloads(cfg.Format, n)
 	})
+}
+
+// webhookPayloads is what to POST for a notification: one Slack
+// message, or one JSON record per alert (or the digest record).
+func webhookPayloads(format string, n Notification) ([][]byte, error) {
+	if format == FormatSlack {
+		b, err := json.Marshal(map[string]string{"text": slackNotification(n)})
+		return [][]byte{b}, err
+	}
+	var out [][]byte
+	if n.Digest != nil {
+		b, err := json.Marshal(NewDigestRecord(n.Digest))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	for _, issue := range n.Alerts {
+		b, err := json.Marshal(NewRecord(issue))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, nil
 }

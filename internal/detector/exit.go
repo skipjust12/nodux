@@ -1,6 +1,9 @@
 package detector
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // ExitDetector fires when a container's main process exits on its own
 // with a non-zero code: a crash, as opposed to someone stopping it.
@@ -15,6 +18,9 @@ import "fmt"
 // An OOM kill also ends in "die" (exit 137) right after the "oom" event;
 // when the OOM detector is enabled that exit is left to it, so the same
 // failure isn't reported twice.
+//
+// Only the event loop touches it (SaveState runs while that loop is
+// paused), so it needs no lock.
 type ExitDetector struct {
 	ignoreCodes map[int]struct{}
 	skipOOM     bool
@@ -53,7 +59,7 @@ func (d *ExitDetector) HandleEvent(ev ContainerEvent) *Issue {
 		if d.skipOOM && oomed {
 			return nil
 		}
-		if _, ignored := d.ignoreCodes[ev.ExitCode]; ignored {
+		if d.ignored(ev) {
 			return nil
 		}
 		hint := exitCodeHint(ev.ExitCode)
@@ -69,9 +75,48 @@ func (d *ExitDetector) HandleEvent(ev ContainerEvent) *Issue {
 				Name:      ev.Name,
 				ExitCode:  ev.ExitCode,
 				OOMKilled: oomed,
+				Labels:    ev.Labels,
 			},
 			DetectedAt: ev.Time,
 		}
+	}
+	return nil
+}
+
+// ignored applies ignore_exit_codes, or the container's own
+// nodux.exit.ignore label instead.
+func (d *ExitDetector) ignored(ev ContainerEvent) bool {
+	if codes, ok := labelInts(ev.Labels, "nodux.exit.ignore"); ok {
+		for _, c := range codes {
+			if c == ev.ExitCode {
+				return true
+			}
+		}
+		return false
+	}
+	_, ignored := d.ignoreCodes[ev.ExitCode]
+	return ignored
+}
+
+type exitSaved struct {
+	Stops map[string]bool `json:"stops,omitempty"`
+	OOMed map[string]bool `json:"oomed,omitempty"`
+}
+
+func (d *ExitDetector) SaveState() ([]byte, error) {
+	return json.Marshal(exitSaved{Stops: d.stops, OOMed: d.oomed})
+}
+
+func (d *ExitDetector) LoadState(data []byte) error {
+	var saved exitSaved
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return err
+	}
+	for id, v := range saved.Stops {
+		d.stops[id] = v
+	}
+	for id, v := range saved.OOMed {
+		d.oomed[id] = v
 	}
 	return nil
 }

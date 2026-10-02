@@ -152,6 +152,15 @@ func TestLoad_Errors(t *testing.T) {
 		"receiver named webhook": "actions:\n  webhook: {enabled: true, url: 'https://x'}\n  receivers:\n    - {name: webhook, type: ntfy, url: 'https://ntfy.sh/t'}\n",
 		"negative deploy grace":  "silences:\n  deploy_grace_seconds: -1\n",
 		"bad listen":             "server:\n  listen: 9321\n",
+		"llm bad effort":         "llm:\n  enabled: true\n  api_key: k\n  effort: extreme\n",
+		"llm too many steps":     "llm:\n  enabled: true\n  api_key: k\n  max_steps: 50\n",
+		"relative state_dir":     "state_dir: state\n",
+		"zero retention":         "history:\n  retention_days: 0\n",
+		"incident window 0":      "incidents:\n  window_minutes: 0\n",
+		"digest without state":   "state_dir: ''\ndigest:\n  enabled: true\n",
+		"digest bad time":        "digest:\n  enabled: true\n  at: '25:00'\n",
+		"digest bad weekday":     "digest:\n  enabled: true\n  every: weekly\n  weekday: someday\n",
+		"telegram without token": "chatops:\n  telegram:\n    enabled: true\n    token: ''\n",
 	} {
 		if _, err := Load(write(t, body)); err == nil {
 			t.Errorf("%s: expected error", name)
@@ -190,6 +199,29 @@ llm:
 	}
 	if cfg.Heartbeat.URL != "https://hc-ping.com/uuid" || cfg.LLM.APIKey != "sk-ant-test" {
 		t.Errorf("heartbeat/llm env not expanded: %q %q", cfg.Heartbeat.URL, cfg.LLM.APIKey)
+	}
+}
+
+func TestLoad_NewSectionsDefaults(t *testing.T) {
+	t.Setenv("NODUX_TELEGRAM_TOKEN", "123:abc")
+	cfg, err := Load(write(t, "chatops:\n  telegram:\n    enabled: true\n    allowed_chat_ids: [42, -100123]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateDir != "/var/lib/nodux" || cfg.History.Retention() != 30*24*time.Hour {
+		t.Errorf("state/history defaults: %q %v", cfg.StateDir, cfg.History.Retention())
+	}
+	if in := cfg.Incidents; !in.Enabled || in.GroupWait() != 30*time.Second || in.Window() != 10*time.Minute {
+		t.Errorf("incidents = %+v", in)
+	}
+	if l := cfg.LLM; l.Effort != "low" || l.MaxSteps != 4 || l.Timeout() != 90*time.Second {
+		t.Errorf("llm = %+v", l)
+	}
+	if tg := cfg.ChatOps.Telegram; tg.Token != "123:abc" || !reflect.DeepEqual(tg.AllowedChatIDs, []int64{42, -100123}) {
+		t.Errorf("telegram = %+v", tg)
+	}
+	if d := cfg.Digest; d.Enabled || d.Every != "daily" || d.At != "09:00" {
+		t.Errorf("digest = %+v", d)
 	}
 }
 

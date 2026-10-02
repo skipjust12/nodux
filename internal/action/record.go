@@ -9,6 +9,9 @@ import (
 const (
 	StateFiring   = "firing"
 	StateResolved = "resolved"
+
+	KindAlert  = "alert"
+	KindDigest = "digest"
 )
 
 // Record is the wire format of an alert, shared by every action that
@@ -17,15 +20,18 @@ const (
 // Container fields are only present for container alerts; host-level
 // alerts (host_disk, docker, ...) carry a resource instead.
 type Record struct {
+	Kind          string   `json:"kind"` // alert
 	Timestamp     string   `json:"timestamp"`
 	State         string   `json:"state"` // firing or resolved
 	Host          string   `json:"host,omitempty"`
 	Detector      string   `json:"detector"`
 	Severity      string   `json:"severity"`
 	Message       string   `json:"message"`
+	IncidentID    int64    `json:"incident_id,omitempty"`
 	Resource      string   `json:"resource,omitempty"`
 	ContainerID   string   `json:"container_id,omitempty"`
 	ContainerName string   `json:"container_name,omitempty"`
+	Image         string   `json:"image,omitempty"`
 	Status        string   `json:"status,omitempty"`
 	RestartCount  *int     `json:"restart_count,omitempty"`
 	LastExitCode  *int     `json:"last_exit_code,omitempty"`
@@ -41,15 +47,18 @@ type Record struct {
 func NewRecord(issue detector.Issue) Record {
 	c := issue.Container
 	r := Record{
+		Kind:          KindAlert,
 		Timestamp:     issue.DetectedAt.UTC().Format(time.RFC3339),
 		State:         StateFiring,
 		Host:          issue.Host,
 		Detector:      issue.Detector,
 		Severity:      issue.Severity,
 		Message:       issue.Message,
+		IncidentID:    issue.IncidentID,
 		Resource:      issue.Resource,
 		ContainerID:   c.ID,
 		ContainerName: c.Name,
+		Image:         c.Image,
 		Status:        c.Status,
 		OOMKilled:     c.OOMKilled,
 		HealthStatus:  c.HealthStatus,
@@ -67,4 +76,29 @@ func NewRecord(issue detector.Issue) Record {
 		r.RestartCount, r.LastExitCode = &restarts, &exit
 	}
 	return r
+}
+
+// DigestRecord is the wire format of a digest.
+type DigestRecord struct {
+	Kind      string `json:"kind"` // digest
+	Timestamp string `json:"timestamp"`
+	Host      string `json:"host,omitempty"`
+	Title     string `json:"title"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Text      string `json:"text"`
+	Data      any    `json:"data,omitempty"`
+}
+
+func NewDigestRecord(d *Digest) DigestRecord {
+	return DigestRecord{
+		Kind:      KindDigest,
+		Timestamp: d.To.UTC().Format(time.RFC3339),
+		Host:      d.Host,
+		Title:     d.Title,
+		From:      d.From.UTC().Format(time.RFC3339),
+		To:        d.To.UTC().Format(time.RFC3339),
+		Text:      d.Text,
+		Data:      d.Data,
+	}
 }

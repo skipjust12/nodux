@@ -2,6 +2,7 @@ package detector
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -50,8 +51,8 @@ type HostOOMDetector struct {
 }
 
 type oomBatch struct {
-	kills int
-	seen  time.Time
+	Kills int       `json:"kills"`
+	Seen  time.Time `json:"seen"`
 }
 
 func NewHostOOMDetector(procPath string, settle, cooldown time.Duration) *HostOOMDetector {
@@ -96,7 +97,7 @@ func (d *HostOOMDetector) Check() *Issue {
 
 	now := d.now()
 	if d.havePrev && n > d.prev {
-		d.pending = append(d.pending, oomBatch{kills: int(n - d.prev), seen: now})
+		d.pending = append(d.pending, oomBatch{Kills: int(n - d.prev), Seen: now})
 	}
 	d.prev, d.havePrev = n, true
 
@@ -104,8 +105,8 @@ func (d *HostOOMDetector) Check() *Issue {
 	// Match container events against kills, oldest first.
 	for len(d.credits) > 0 && len(d.pending) > 0 {
 		d.credits = d.credits[1:]
-		d.pending[0].kills--
-		if d.pending[0].kills == 0 {
+		d.pending[0].Kills--
+		if d.pending[0].Kills == 0 {
 			d.pending = d.pending[1:]
 		}
 	}
@@ -116,8 +117,8 @@ func (d *HostOOMDetector) Check() *Issue {
 	}
 	d.mu.Unlock()
 
-	for len(d.pending) > 0 && now.Sub(d.pending[0].seen) >= d.settle {
-		d.confirmed += d.pending[0].kills
+	for len(d.pending) > 0 && now.Sub(d.pending[0].Seen) >= d.settle {
+		d.confirmed += d.pending[0].Kills
 		d.pending = d.pending[1:]
 	}
 	if d.confirmed == 0 || (!d.lastAlert.IsZero() && now.Sub(d.lastAlert) < d.cooldown) {
@@ -170,3 +171,32 @@ func readVmstat(path, key string) (uint64, error) {
 }
 
 var errNoCounter = errors.New("no counter named")
+
+type hostOOMSaved struct {
+	Counter   uint64     `json:"counter"`
+	Pending   []oomBatch `json:"pending,omitempty"`
+	Confirmed int        `json:"confirmed,omitempty"`
+	LastAlert time.Time  `json:"last_alert,omitempty"`
+}
+
+// SaveState keeps the counter, so kills while nodux was down are still
+// counted (container OOMs from that time come back with the replayed
+// events), along with the kills not reported yet and the cooldown.
+func (d *HostOOMDetector) SaveState() ([]byte, error) {
+	if !d.havePrev {
+		return json.Marshal(nil)
+	}
+	return json.Marshal(hostOOMSaved{Counter: d.prev, Pending: d.pending, Confirmed: d.confirmed, LastAlert: d.lastAlert})
+}
+
+func (d *HostOOMDetector) LoadState(data []byte) error {
+	var sv *hostOOMSaved
+	if err := json.Unmarshal(data, &sv); err != nil || sv == nil {
+		return err
+	}
+	// After a reboot the counter starts over below the saved value;
+	// Check then just takes a new baseline.
+	d.prev, d.havePrev = sv.Counter, true
+	d.pending, d.confirmed, d.lastAlert = sv.Pending, sv.Confirmed, sv.LastAlert
+	return nil
+}

@@ -230,3 +230,33 @@ func TestProber_SkipVerify(t *testing.T) {
 		t.Fatalf("certificates should be recorded even when verification fails: %+v", p.Certs())
 	}
 }
+
+func TestProber_State(t *testing.T) {
+	closed, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := closed.Addr().String()
+	closed.Close()
+
+	p := New(Config{Failures: 2, Targets: []Target{{Name: "pg", TCP: addr}}})
+	p.Check()
+	if issues := p.Check(); len(issues) != 1 {
+		t.Fatalf("got %+v", issues)
+	}
+	p.state["pg"].cert = &CertInfo{Target: "pg", Subject: "pg.test", NotAfter: time.Now().Add(time.Hour)}
+	saved, err := p.SaveState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p2 := New(Config{Failures: 2, Targets: []Target{{Name: "pg", TCP: addr}}})
+	if err := p2.LoadState(saved); err != nil {
+		t.Fatal(err)
+	}
+	// Still failing after the restart: still an issue on the first check,
+	// rather than a resolution followed by a new alert.
+	if issues := p2.Check(); len(issues) != 1 {
+		t.Fatalf("restored probe: %+v", issues)
+	}
+	if certs := p2.Certs(); len(certs) != 1 || certs[0].Subject != "pg.test" {
+		t.Fatalf("certs = %+v", certs)
+	}
+}

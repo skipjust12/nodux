@@ -1,6 +1,7 @@
 package action
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/redact"
 )
 
@@ -20,21 +20,24 @@ const (
 	httpQueueSize = 100
 )
 
-// HTTPAction delivers alerts with one HTTP request each: a webhook, a
+// HTTPAction delivers notifications as HTTP POSTs: a webhook, a
 // Telegram bot, an ntfy topic. Delivery happens on a background worker
-// so a slow or dead endpoint never stalls the detection loops; Run only
-// enqueues. Failed deliveries are retried on network errors, 5xx and
-// 429, with backoff, and drained on Close.
+// so a slow or dead endpoint never stalls the detection loops; Send
+// only enqueues. Failed deliveries are retried on network errors, 5xx
+// and 429, with backoff, and drained on Close.
 type HTTPAction struct {
 	name    string
-	safeURL string // scheme and host only, for logs
-	build   func(ctx context.Context, issue detector.Issue) (*http.Request, error)
+	url     string
+	headers map[string]string
+	// bodies renders a notification as the JSON bodies to POST: one
+	// message, or one per alert (webhook in json format).
+	bodies  func(n Notification) ([][]byte, error)
 	client  *http.Client
 	backoff time.Duration // first retry delay, doubles each attempt
 
 	mu     sync.RWMutex // guards closed and the send on queue
 	closed bool
-	queue  chan detector.Issue
+	queue  chan Notification
 
 	sent, failed, dropped atomic.Uint64
 
@@ -43,26 +46,28 @@ type HTTPAction struct {
 	done   chan struct{}
 }
 
-// DeliveryStats counts what happened to the alerts an action was given.
+// DeliveryStats counts what happened to the messages an action was
+// given.
 type DeliveryStats struct {
 	Sent    uint64 `json:"sent"`
-	Failed  uint64 `json:"failed"`
+	Failed  uint64 `json:"failed"`  // after retries
 	Dropped uint64 `json:"dropped"` // queue full
 	Pending int    `json:"pending"`
 }
 
-func newHTTPAction(name, rawURL string, timeout time.Duration, build func(context.Context, detector.Issue) (*http.Request, error)) *HTTPAction {
+func newHTTPAction(name, url string, headers map[string]string, timeout time.Duration, bodies func(Notification) ([][]byte, error)) *HTTPAction {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &HTTPAction{
 		name:    name,
-		safeURL: redact.URL(rawURL),
-		build:   build,
+		url:     url,
+		headers: headers,
+		bodies:  bodies,
 		client:  &http.Client{Timeout: timeout},
 		backoff: time.Second,
-		queue:   make(chan detector.Issue, httpQueueSize),
+		queue:   make(chan Notification, httpQueueSize),
 		ctx:     ctx,
 		cancel:  cancel,
 		done:    make(chan struct{}),
@@ -73,18 +78,18 @@ func newHTTPAction(name, rawURL string, timeout time.Duration, build func(contex
 
 func (a *HTTPAction) Name() string { return a.name }
 
-func (a *HTTPAction) Run(_ context.Context, issue detector.Issue) error {
+func (a *HTTPAction) Send(_ context.Context, n Notification) error {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.closed {
 		return fmt.Errorf("%s is closed", a.name)
 	}
 	select {
-	case a.queue <- issue:
+	case a.queue <- n:
 		return nil
 	default:
 		a.dropped.Add(1)
-		return fmt.Errorf("%s queue full (%d pending), dropping alert", a.name, httpQueueSize)
+		return fmt.Errorf("%s queue full (%d pending), dropping notification", a.name, httpQueueSize)
 	}
 }
 
@@ -97,7 +102,7 @@ func (a *HTTPAction) Stats() DeliveryStats {
 	}
 }
 
-// Close stops accepting alerts and waits for queued ones to be
+// Close stops accepting notifications and waits for queued ones to be
 // delivered. If ctx expires first, in-flight deliveries are abandoned.
 func (a *HTTPAction) Close(ctx context.Context) error {
 	a.mu.Lock()
@@ -119,20 +124,28 @@ func (a *HTTPAction) Close(ctx context.Context) error {
 
 func (a *HTTPAction) worker() {
 	defer close(a.done)
-	for issue := range a.queue {
-		if err := a.deliver(issue); err != nil {
+	for n := range a.queue {
+		bodies, err := a.bodies(n)
+		if err != nil {
 			a.failed.Add(1)
-			slog.Error("alert delivery failed", "action", a.name, "url", a.safeURL, "detector", issue.Detector, "container", issue.Container.Name, "error", err)
+			slog.Error("rendering notification failed", "action", a.name, "incident", n.IncidentID, "error", err)
 			continue
 		}
-		a.sent.Add(1)
+		for _, body := range bodies {
+			if err := a.deliver(body); err != nil {
+				a.failed.Add(1)
+				slog.Error("alert delivery failed", "action", a.name, "url", redact.URL(a.url), "incident", n.IncidentID, "error", err)
+				continue
+			}
+			a.sent.Add(1)
+		}
 	}
 }
 
-func (a *HTTPAction) deliver(issue detector.Issue) error {
+func (a *HTTPAction) deliver(body []byte) error {
 	delay := a.backoff
 	for attempt := 1; ; attempt++ {
-		retry, err := a.post(issue)
+		retry, err := a.post(body)
 		if err == nil {
 			return nil
 		}
@@ -149,12 +162,16 @@ func (a *HTTPAction) deliver(issue detector.Issue) error {
 }
 
 // post sends one request; retry says whether the failure is transient.
-func (a *HTTPAction) post(issue detector.Issue) (retry bool, err error) {
-	req, err := a.build(a.ctx, issue)
+func (a *HTTPAction) post(body []byte) (retry bool, err error) {
+	req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, a.url, bytes.NewReader(body))
 	if err != nil {
 		return false, redact.Err(err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "nodux")
+	for k, v := range a.headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := a.client.Do(req)
 	if err != nil {

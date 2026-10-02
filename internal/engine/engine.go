@@ -3,13 +3,15 @@
 // loop that checks the host and feeds container snapshots to Detectors,
 // an event loop that feeds the daemon's event stream to EventDetectors,
 // and a probe loop for checks that go over the network. Alerts go out
-// through a dispatcher goroutine, so a slow LLM call or action never
-// holds up detection.
+// through a dispatcher goroutine that groups them into incidents and
+// runs the LLM layer, so neither can hold up detection. Silences and
+// deploy windows hold alerts back from receivers.
+// With a state file, open alerts, detector state and the event stream
+// position survive a restart.
 package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -22,9 +24,12 @@ import (
 	"github.com/skipjust12/nodux/internal/action"
 	"github.com/skipjust12/nodux/internal/detector"
 	"github.com/skipjust12/nodux/internal/dockerclient"
+	"github.com/skipjust12/nodux/internal/history"
+	"github.com/skipjust12/nodux/internal/incident"
 	"github.com/skipjust12/nodux/internal/llm"
 	"github.com/skipjust12/nodux/internal/redact"
 	"github.com/skipjust12/nodux/internal/silence"
+	"github.com/skipjust12/nodux/internal/state"
 )
 
 const (
@@ -33,9 +38,7 @@ const (
 	initialBackoff = 1 * time.Second
 	maxBackoff     = 30 * time.Second
 
-	queueSize       = 256
-	classifyBatch   = 16
-	classifyWorkers = 4
+	queueSize = 256
 
 	dockerDetector = "docker"
 )
@@ -46,12 +49,21 @@ type Options struct {
 	HostDetectors  []detector.HostDetector
 	Expected       *detector.ExpectedDetector
 	Actions        []action.Action
-	// Classifier annotates container alerts with a probable cause.
-	// nil disables it.
-	Classifier llm.Classifier
+	// Grouping groups related alerts into incidents; its zero value
+	// sends every alert on its own, right away.
+	Grouping incident.Config
+	// Analyzer annotates incidents with a probable cause. nil disables it.
+	Analyzer llm.Analyzer
 	// Redactor scrubs messages and logs before they leave the host (and
-	// before they reach the classifier). nil disables it.
+	// before they reach the analyzer). nil disables it.
 	Redactor *redact.Redactor
+	// State keeps open alerts, detector state and the event stream
+	// position across restarts. nil keeps them in memory only.
+	State *state.File
+	// History records every alert sent and, every SampleInterval, the
+	// memory use of each running container. nil disables both.
+	History        *history.Store
+	SampleInterval time.Duration
 	// Hostname is stamped on every alert.
 	Hostname     string
 	PollInterval time.Duration
@@ -79,8 +91,8 @@ type Options struct {
 	// so a slow target never holds up the poll loop.
 	Probes        []detector.HostDetector
 	ProbeInterval time.Duration
-	// Silences mutes alerts on their way to receivers. nil disables
-	// silences altogether.
+	// Silences holds alerts back from receivers. nil disables silences
+	// altogether.
 	Silences *silence.Store
 	// DeployGrace is how long the deploy window for a container (and its
 	// compose project) stays open after its last create, stop or destroy
@@ -98,16 +110,33 @@ type Engine struct {
 	// Detectors that implement both interfaces (crashloop): their event
 	// issues open level-triggered episodes instead of one-off alerts.
 	levelEvents map[string]bool
+	stateful    []detector.Stateful
+	grouper     *incident.Grouper
 
 	// Only touched by the poll loop.
-	lastSeen map[string]struct{}
+	lastSeen     map[string]struct{}
+	nextSample   time.Time
+	saveFailing  bool
+	imagesPruned time.Time
 
-	// mu guards everything below up to counts; the poll, event and
-	// probe loops all report issues.
+	// eventMu is held while the event loop handles an event, and by
+	// saveState, which needs the event detectors and the stream position
+	// to agree. It guards evSince, evLast and evHandled.
+	eventMu   sync.Mutex
+	evSince   time.Time       // where to resume the stream
+	evLast    time.Time       // timestamp of the last event handled
+	evHandled map[string]bool // events at evLast already handled
+
+	// mu guards everything below; the poll loop, the event loop, the
+	// probe loop and the dispatcher all touch it.
 	mu         sync.Mutex
 	lastAlert  map[string]time.Time // "detector/container name" -> when
 	active     map[string]*activeAlert
-	containers map[string]containerRef // by name, as of the last poll
+	images     map[string]*imageInfo        // by container name
+	labels     map[string]map[string]string // by container ID, from polls, for events without labels
+	starts     map[string]time.Time         // last "start" by container ID
+	lastRuns   map[string]time.Duration     // how long the last run lasted, by container ID
+	containers map[string]containerRef      // by name, as of the last poll
 	lastPoll   time.Time
 	counts     map[AlertKey]uint64
 	now        func() time.Time
@@ -153,6 +182,17 @@ type Episode struct {
 	Silenced bool `json:"silenced,omitempty"`
 }
 
+// imageInfo tracks which image a container name runs, so the LLM layer
+// can tell a crash right after a deploy from one out of the blue.
+type imageInfo struct {
+	Image     string    `json:"image"`    // as configured: api:latest
+	ImageID   string    `json:"image_id"` // sha256:...
+	Since     time.Time `json:"since"`    // first seen running it
+	Prev      string    `json:"prev,omitempty"`
+	ChangedAt time.Time `json:"changed_at,omitempty"`
+	LastSeen  time.Time `json:"last_seen"` // day granularity, for pruning
+}
+
 func New(docker *dockerclient.Client, opts Options) *Engine {
 	exclude := make(map[string]struct{}, len(opts.ExcludeContainers))
 	for _, name := range opts.ExcludeContainers {
@@ -164,25 +204,81 @@ func New(docker *dockerclient.Client, opts Options) *Engine {
 			levelEvents[d.Name()] = true
 		}
 	}
-	return &Engine{
+	e := &Engine{
 		docker:            docker,
 		opts:              opts,
 		minBackoff:        initialBackoff,
 		excludeContainers: exclude,
 		levelEvents:       levelEvents,
+		grouper:           incident.New(opts.Grouping),
 		lastSeen:          make(map[string]struct{}),
+		evHandled:         make(map[string]bool),
 		lastAlert:         make(map[string]time.Time),
 		active:            make(map[string]*activeAlert),
+		images:            make(map[string]*imageInfo),
+		labels:            make(map[string]map[string]string),
+		starts:            make(map[string]time.Time),
+		lastRuns:          make(map[string]time.Duration),
 		containers:        make(map[string]containerRef),
 		counts:            make(map[AlertKey]uint64),
 		now:               time.Now,
 		queue:             make(chan detector.Issue, queueSize),
 	}
+	e.stateful = collectStateful(opts)
+	return e
+}
+
+func collectStateful(opts Options) []detector.Stateful {
+	var out []detector.Stateful
+	seen := make(map[string]bool)
+	add := func(d any) {
+		if s, ok := d.(detector.Stateful); ok && !seen[s.Name()] {
+			seen[s.Name()] = true
+			out = append(out, s)
+		}
+	}
+	for _, d := range opts.Detectors {
+		add(d)
+	}
+	for _, d := range opts.EventDetectors {
+		add(d)
+	}
+	for _, d := range opts.HostDetectors {
+		add(d)
+	}
+	for _, d := range opts.Probes {
+		add(d)
+	}
+	if opts.Expected != nil {
+		add(opts.Expected)
+	}
+	if opts.HostOOM != nil {
+		add(opts.HostOOM)
+	}
+	return out
 }
 
 // Healthy reports whether the last poll of the Docker daemon worked.
 // The heartbeat only pings while it does.
 func (e *Engine) Healthy() bool { return e.healthy.Load() }
+
+// ActiveAlerts returns the open alerts, oldest first, each with
+// DetectedAt set to when it started.
+func (e *Engine) ActiveAlerts() []detector.Issue {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]detector.Issue, 0, len(e.active))
+	for _, a := range e.active {
+		issue := a.issue
+		issue.DetectedAt = a.since
+		issue.Logs = nil
+		issue.Message = e.opts.Redactor.String(issue.Message)
+		issue.Silenced = !a.notified
+		out = append(out, issue)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DetectedAt.Before(out[j].DetectedAt) })
+	return out
+}
 
 // LastPoll is when the Docker daemon was last polled successfully.
 func (e *Engine) LastPoll() time.Time {
@@ -193,26 +289,19 @@ func (e *Engine) LastPoll() time.Time {
 
 // Episodes returns the open level-triggered problems, oldest first.
 func (e *Engine) Episodes() []Episode {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]Episode, 0, len(e.active))
-	for _, a := range e.active {
-		out = append(out, Episode{
-			Detector:  a.issue.Detector,
-			Severity:  a.issue.Severity,
-			Container: a.issue.Container.Name,
-			Resource:  a.issue.Resource,
-			Message:   a.issue.Message,
-			Since:     a.since,
-			Silenced:  !a.notified,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].Since.Equal(out[j].Since) {
-			return out[i].Since.Before(out[j].Since)
+	alerts := e.ActiveAlerts()
+	out := make([]Episode, len(alerts))
+	for i, a := range alerts {
+		out[i] = Episode{
+			Detector:  a.Detector,
+			Severity:  a.Severity,
+			Container: a.Container.Name,
+			Resource:  a.Resource,
+			Message:   a.Message,
+			Since:     a.DetectedAt,
+			Silenced:  a.Silenced,
 		}
-		return out[i].Detector+out[i].Container+out[i].Resource < out[j].Detector+out[j].Container+out[j].Resource
-	})
+	}
 	return out
 }
 
@@ -229,9 +318,12 @@ func (e *Engine) AlertCounts() map[AlertKey]uint64 {
 }
 
 // Run drives both loops until ctx is cancelled, then delivers whatever
-// alerts are still queued. Docker socket errors don't crash the daemon:
-// they're logged, and each loop retries with exponential backoff.
+// alerts are still queued and saves the state one last time. Docker
+// socket errors don't crash the daemon: they're logged, and each loop
+// retries with exponential backoff.
 func (e *Engine) Run(ctx context.Context) {
+	e.restore()
+
 	dispatched := make(chan struct{})
 	go func() {
 		defer close(dispatched)
@@ -258,6 +350,7 @@ func (e *Engine) Run(ctx context.Context) {
 
 	close(e.queue)
 	<-dispatched
+	e.saveState()
 }
 
 func (e *Engine) needEvents() bool {
@@ -288,6 +381,7 @@ func (e *Engine) runPoll(ctx context.Context) {
 				downSince = e.now()
 			}
 			e.dockerDown(ctx, downSince, err)
+			e.saveState()
 			slog.Error("poll failed, will retry", "error", err, "retry_in", backoff.String())
 			if !sleep(ctx, backoff) {
 				return
@@ -297,10 +391,10 @@ func (e *Engine) runPoll(ctx context.Context) {
 		}
 
 		e.healthy.Store(true)
-		if !downSince.IsZero() {
-			downSince = time.Time{}
-			e.dockerUp(ctx)
-		}
+		downSince = time.Time{}
+		// Also resolves a daemon outage that started before a restart.
+		e.dockerUp(ctx)
+		e.saveState()
 		backoff = e.minBackoff
 		if !sleep(ctx, e.opts.PollInterval) {
 			return
@@ -308,36 +402,38 @@ func (e *Engine) runPoll(ctx context.Context) {
 	}
 }
 
-// runEvents keeps the event stream open. After a disconnect it resumes
-// from the last event it processed, so events that happened while the
-// stream was down are replayed instead of lost.
+// runEvents keeps the event stream open. After a disconnect, or a
+// restart of nodux, it resumes from the last event it handled, so
+// events that happened in between are replayed instead of lost.
 func (e *Engine) runEvents(ctx context.Context) {
-	since := e.now()
-	// The daemon replays everything from `since` inclusive, and distinct
-	// events can share a timestamp, so remember which ones at the last
-	// timestamp were already handled.
-	var last time.Time
-	handledAtLast := make(map[string]bool)
 	backoff := e.minBackoff
-
 	for {
+		e.eventMu.Lock()
+		since := e.evSince
+		e.eventMu.Unlock()
+
 		connectedAt := time.Now()
 		err := e.docker.Events(ctx, since, detector.EventActions, func(ev dockerclient.Event) {
+			e.eventMu.Lock()
+			defer e.eventMu.Unlock()
+			// The daemon replays everything from `since` inclusive, and
+			// distinct events can share a timestamp, so remember which ones
+			// at the last timestamp were already handled.
 			t := time.Unix(0, ev.TimeNano)
 			key := ev.Action + "/" + ev.Actor.ID
 			switch {
-			case t.Before(last):
+			case t.Before(e.evLast):
 				return
-			case t.Equal(last):
-				if handledAtLast[key] {
+			case t.Equal(e.evLast):
+				if e.evHandled[key] {
 					return
 				}
 			default:
-				last = t
-				clear(handledAtLast)
+				e.evLast = t
+				clear(e.evHandled)
 			}
-			handledAtLast[key] = true
-			since = t
+			e.evHandled[key] = true
+			e.evSince = t
 			e.handleEvent(ctx, ev, t)
 		})
 		if ctx.Err() != nil {
@@ -452,6 +548,11 @@ func (e *Engine) dockerUp(ctx context.Context) {
 	}
 }
 
+func (e *Engine) excluded(name string, labels map[string]string) bool {
+	_, excluded := e.excludeContainers[name]
+	return excluded || detector.Excluded(labels)
+}
+
 func (e *Engine) pollOnce(ctx context.Context) error {
 	if err := e.docker.Ping(ctx); err != nil {
 		return err
@@ -462,16 +563,32 @@ func (e *Engine) pollOnce(ctx context.Context) error {
 		return err
 	}
 
+	now := e.now()
+	sample := e.opts.History != nil && e.opts.SampleInterval > 0 && !now.Before(e.nextSample)
+	var samples []history.MemorySample
+
 	seen := make(map[string]struct{}, len(summaries))
 	statuses := make(map[string]string, len(summaries))
 	refs := make(map[string]containerRef, len(summaries))
+	var labeledExpected []string
 	for _, summary := range summaries {
 		seen[summary.ID] = struct{}{}
 
 		name := containerName(summary)
 		statuses[name] = summary.State
-		refs[name] = containerRef{id: summary.ID, project: summary.Labels[dockerclient.ProjectLabel]}
-		if _, excluded := e.excludeContainers[name]; excluded || len(e.opts.Detectors) == 0 {
+		refs[name] = containerRef{id: summary.ID, project: summary.Labels[detector.LabelComposeProject]}
+		labels := detector.RelevantLabels(summary.Labels)
+		e.mu.Lock()
+		e.labels[summary.ID] = labels
+		e.mu.Unlock()
+		if e.excluded(name, labels) {
+			continue
+		}
+		e.noteImage(name, summary, now)
+		if detector.ExpectedByLabel(labels) {
+			labeledExpected = append(labeledExpected, name)
+		}
+		if len(e.opts.Detectors) == 0 && !sample {
 			continue
 		}
 
@@ -488,11 +605,16 @@ func (e *Engine) pollOnce(ctx context.Context) error {
 		refs[name] = ref
 
 		snapshot := toSnapshot(name, inspect)
-		e.collectStats(ctx, inspect, &snapshot)
+		if stats := e.collectStats(ctx, inspect, &snapshot, sample); stats != nil && sample {
+			samples = append(samples, history.MemorySample{Time: now, Container: name, Used: stats.MemoryUsed(), Limit: snapshot.MemoryMax})
+		}
 
 		var out []*detector.Issue
 		for _, d := range e.opts.Detectors {
-			issue := d.Check(snapshot)
+			var issue *detector.Issue
+			if detector.Enabled(snapshot.Labels, d.Name()) {
+				issue = d.Check(snapshot)
+			}
 			if o := e.trackAt(d.Name()+"/"+summary.ID, issue, &snapshot, observedAt); o != nil {
 				out = append(out, o)
 			}
@@ -512,7 +634,7 @@ func (e *Engine) pollOnce(ctx context.Context) error {
 	e.mu.Unlock()
 
 	if e.opts.Expected != nil {
-		out := e.trackSet(e.opts.Expected.Name(), e.opts.Expected.Check(statuses), func(i *detector.Issue) string { return i.Container.Name })
+		out := e.trackSet(e.opts.Expected.Name(), e.opts.Expected.Check(statuses, labeledExpected), func(i *detector.Issue) string { return i.Container.Name })
 		for _, issue := range out {
 			// An existing but stopped container has logs worth seeing.
 			id := refs[issue.Container.Name].id
@@ -523,26 +645,35 @@ func (e *Engine) pollOnce(ctx context.Context) error {
 		}
 	}
 
+	if sample {
+		e.nextSample = now.Add(e.opts.SampleInterval)
+		if err := e.opts.History.AddMemorySamples(ctx, samples); err != nil {
+			slog.Warn("recording memory samples failed", "error", err)
+		}
+	}
 	e.forgetGone(ctx, seen)
+	e.pruneImages(now)
 	return nil
 }
 
-// collectStats fills in memory and CPU throttling numbers for a running
-// container that has the corresponding limit, if a detector wants them.
-func (e *Engine) collectStats(ctx context.Context, inspect *dockerclient.ContainerInspect, snap *detector.ContainerSnapshot) {
+// collectStats fetches stats for a running container when a detector
+// needs its memory (memory limit set) or CPU throttling (CPU limit set)
+// numbers, or memory is being sampled, and fills in the snapshot. It
+// returns the stats, nil if none were fetched.
+func (e *Engine) collectStats(ctx context.Context, inspect *dockerclient.ContainerInspect, snap *detector.ContainerSnapshot, sample bool) *dockerclient.Stats {
 	if !inspect.State.Running {
-		return
+		return nil
 	}
 	needMem := e.opts.CollectStats && inspect.HostConfig.Memory > 0
 	cpuLimit := inspect.CPULimit()
 	needCPU := e.opts.CollectThrottling && cpuLimit > 0
-	if !needMem && !needCPU {
-		return
+	if !needMem && !needCPU && !sample {
+		return nil
 	}
 	stats, err := e.docker.ContainerStats(ctx, inspect.ID)
 	if err != nil {
 		logContainerErr("fetch stats failed", snap.Name, err)
-		return
+		return nil
 	}
 	if needMem {
 		snap.MemoryUsed = stats.MemoryUsed()
@@ -554,11 +685,58 @@ func (e *Engine) collectStats(ctx context.Context, inspect *dockerclient.Contain
 		snap.CPUPeriods = t.Periods
 		snap.CPUThrottledPeriods = t.ThrottledPeriods
 	}
+	return stats
+}
+
+// noteImage records the image a container runs, and when that changed.
+func (e *Engine) noteImage(name string, c dockerclient.ContainerSummary, now time.Time) {
+	if c.ImageID == "" {
+		return
+	}
+	day := now.UTC().Truncate(24 * time.Hour)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.images[name]
+	switch {
+	case cur == nil:
+		e.images[name] = &imageInfo{Image: c.Image, ImageID: c.ImageID, Since: now, LastSeen: day}
+	case cur.ImageID != c.ImageID:
+		// A redeploy recreates the container: its creation time is when
+		// the new image went in. Otherwise (a restart policy picking up a
+		// retagged image) all we know is "by now".
+		changed := now
+		if created := time.Unix(c.Created, 0); c.Created > 0 && created.After(cur.Since) && created.Before(now) {
+			changed = created
+		}
+		e.images[name] = &imageInfo{
+			Image: c.Image, ImageID: c.ImageID, Since: changed, LastSeen: day,
+			Prev:      fmt.Sprintf("%s (%s)", cur.Image, shortID(cur.ImageID)),
+			ChangedAt: changed,
+		}
+	default:
+		cur.LastSeen = day
+	}
+}
+
+// pruneImages forgets container names not seen for a week, at most once
+// a day: docker run without --name makes up a new one every time.
+func (e *Engine) pruneImages(now time.Time) {
+	if now.Sub(e.imagesPruned) < 24*time.Hour {
+		return
+	}
+	e.imagesPruned = now
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for name, img := range e.images {
+		if now.Sub(img.LastSeen) > 7*24*time.Hour {
+			delete(e.images, name)
+		}
+	}
 }
 
 // forgetGone drops detector state for containers that were present on
-// the previous poll but have since been removed, and closes their open
-// episodes.
+// the previous poll (or had alerts open when nodux last stopped) but
+// have since been removed, and closes their open episodes.
 func (e *Engine) forgetGone(ctx context.Context, seen map[string]struct{}) {
 	for id := range e.lastSeen {
 		if _, ok := seen[id]; ok {
@@ -569,21 +747,46 @@ func (e *Engine) forgetGone(ctx context.Context, seen map[string]struct{}) {
 				f.Forget(id)
 			}
 		}
+		e.forgetContainer(id)
 		e.report(ctx, "", false, e.resolveContainer(id))
 	}
 	e.lastSeen = seen
 }
 
+func (e *Engine) forgetContainer(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.labels, id)
+	delete(e.starts, id)
+	delete(e.lastRuns, id)
+}
+
 func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.Time) {
 	name := strings.TrimPrefix(ev.Actor.Attributes["name"], "/")
+	// Every container OOM, excluded containers' too, so it isn't taken
+	// for a host OOM.
+	if ev.Action == "oom" && e.opts.HostOOM != nil {
+		e.opts.HostOOM.ContainerOOM()
+	}
+	labels := detector.RelevantLabels(ev.Actor.Attributes)
+	if len(labels) == 0 {
+		// Podman doesn't put labels in event attributes; the last poll saw them.
+		e.mu.Lock()
+		labels = e.labels[ev.Actor.ID]
+		e.mu.Unlock()
+	}
+	if e.excluded(name, labels) {
+		return
+	}
+
 	cev := detector.ContainerEvent{
 		ID:       ev.Actor.ID,
 		Name:     name,
 		Action:   ev.Action,
-		Project:  ev.Actor.Attributes[dockerclient.ProjectLabel],
 		ExitCode: eventExitCode(ev.Actor.Attributes),
 		Signal:   detector.ParseSignal(ev.Actor.Attributes["signal"]),
 		Time:     t,
+		Labels:   labels,
 	}
 	// Docker: "health_status: unhealthy"; Podman: "health_status" with
 	// the status in an attribute.
@@ -592,16 +795,6 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 	} else if cev.Action == "health_status" {
 		cev.HealthStatus = ev.Actor.Attributes["health_status"]
 	}
-
-	// Every container OOM, excluded containers' too, so it isn't taken
-	// for a host OOM.
-	if cev.Action == "oom" && e.opts.HostOOM != nil {
-		e.opts.HostOOM.ContainerOOM()
-	}
-	if _, excluded := e.excludeContainers[name]; excluded {
-		return
-	}
-
 	if cev.Action == "kill" {
 		// Needed to tell docker stop (the configured stop signal) from
 		// docker kill -s HUP. The container is still alive at this point.
@@ -613,8 +806,9 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 		}
 	}
 	if e.deployWindows() && isDeployEvent(cev) {
-		e.opts.Silences.Deploy(name, cev.Project, t.Add(e.opts.DeployGrace))
+		e.opts.Silences.Deploy(name, labels[detector.LabelComposeProject], t.Add(e.opts.DeployGrace))
 	}
+	e.noteRun(cev)
 
 	type found struct {
 		d     detector.EventDetector
@@ -622,6 +816,9 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 	}
 	var hits []found
 	for _, d := range e.opts.EventDetectors {
+		if !detector.Enabled(labels, d.Name()) {
+			continue
+		}
 		issue := d.HandleEvent(cev)
 		if issue == nil {
 			continue
@@ -642,7 +839,19 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 		if err == nil {
 			tty = inspect.Config.Tty
 			snap = toSnapshot(name, inspect)
+			if (cev.Action == "die" || cev.Action == "oom") && !snap.StartedAt.IsZero() && snap.StartedAt.Before(t) {
+				// The run that just ended, if nodux missed its start.
+				e.mu.Lock()
+				if _, ok := e.lastRuns[cev.ID]; !ok {
+					e.lastRuns[cev.ID] = t.Sub(snap.StartedAt)
+				}
+				e.mu.Unlock()
+			}
 		}
+		e.mu.Lock()
+		lastRun := e.lastRuns[cev.ID]
+		e.mu.Unlock()
+
 		var issues []*detector.Issue
 		for _, h := range hits {
 			issue := h.issue
@@ -654,6 +863,7 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 					continue
 				}
 			}
+			issue.Container.LastRun = lastRun
 			if e.levelEvents[h.d.Name()] {
 				issue = e.track(h.d.Name()+"/"+cev.ID, issue, nil)
 			} else {
@@ -667,6 +877,7 @@ func (e *Engine) handleEvent(ctx context.Context, ev dockerclient.Event, t time.
 	}
 
 	if cev.Action == "destroy" {
+		e.forgetContainer(cev.ID)
 		e.report(ctx, "", false, e.resolveContainer(cev.ID))
 	}
 }
@@ -682,6 +893,24 @@ func isDeployEvent(ev detector.ContainerEvent) bool {
 		return detector.IsStopRequest(ev)
 	}
 	return false
+}
+
+// noteRun keeps track of how long each run of a container lasts: "died
+// 2s after starting" and "died after 3 days" are different problems.
+func (e *Engine) noteRun(ev detector.ContainerEvent) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch ev.Action {
+	case "start":
+		e.starts[ev.ID] = ev.Time
+	case "oom", "die":
+		// An OOM kill comes just before its die; either ends the run.
+		if s, ok := e.starts[ev.ID]; ok && ev.Time.After(s) {
+			e.lastRuns[ev.ID] = ev.Time.Sub(s)
+		} else {
+			delete(e.lastRuns, ev.ID)
+		}
+	}
 }
 
 // track updates one level-triggered problem, identified by key, with
@@ -708,6 +937,7 @@ func (e *Engine) trackLocked(key string, issue *detector.Issue, current *detecto
 	a, active := e.active[key]
 	switch {
 	case issue != nil && !active:
+		issue.Key = key
 		issue.Silenced = e.silencedLocked(issue, false)
 		stored := *issue
 		stored.Silenced = false
@@ -716,6 +946,7 @@ func (e *Engine) trackLocked(key string, issue *detector.Issue, current *detecto
 	case issue != nil && active && detector.SeverityRank(issue.Severity) > detector.SeverityRank(a.issue.Severity):
 		// Escalation (a certificate going from 14 days left to 2): a new
 		// alert within the same episode.
+		issue.Key = key
 		issue.Silenced = e.silencedLocked(issue, false)
 		a.issue = *issue
 		a.issue.Silenced = false
@@ -802,7 +1033,7 @@ func (e *Engine) silencedLocked(issue *detector.Issue, oneOff bool) bool {
 		return false
 	}
 	c := issue.Container
-	project := c.Project
+	project := c.Project()
 	if project == "" && c.Name != "" {
 		project = e.containers[c.Name].project
 	}
@@ -921,80 +1152,6 @@ func hasAudible(issues []*detector.Issue) bool {
 	return false
 }
 
-// dispatch sends queued alerts to every action until the queue is
-// closed. Alerts that arrive together are classified concurrently, then
-// sent in order. Once ctx is cancelled (shutting down), classification
-// is skipped so pending alerts go out right away.
-func (e *Engine) dispatch(ctx context.Context) {
-	for first := range e.queue {
-		batch := []detector.Issue{first}
-	drain:
-		for len(batch) < classifyBatch {
-			select {
-			case issue, ok := <-e.queue:
-				if !ok {
-					break drain
-				}
-				batch = append(batch, issue)
-			default:
-				break drain
-			}
-		}
-
-		e.classify(ctx, batch)
-		for _, issue := range batch {
-			e.count(issue)
-			for _, a := range e.opts.Actions {
-				if err := a.Run(context.Background(), issue); err != nil {
-					slog.Error("action failed", "action", a.Name(), "detector", issue.Detector, "container", issue.Container.Name, "error", err)
-				}
-			}
-		}
-	}
-}
-
-func (e *Engine) count(issue detector.Issue) {
-	state := "firing"
-	if issue.Resolved {
-		state = "resolved"
-	}
-	e.mu.Lock()
-	e.counts[AlertKey{Detector: issue.Detector, Severity: issue.Severity, State: state, Silenced: issue.Silenced}]++
-	e.mu.Unlock()
-}
-
-func (e *Engine) classify(ctx context.Context, batch []detector.Issue) {
-	if e.opts.Classifier == nil || ctx.Err() != nil {
-		return
-	}
-	sem := make(chan struct{}, classifyWorkers)
-	var wg sync.WaitGroup
-	for i := range batch {
-		issue := &batch[i]
-		// Only container alerts come with logs to reason about, and
-		// silenced ones aren't worth the budget.
-		if issue.Resolved || issue.Silenced || issue.Container.Name == "" {
-			continue
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			analysis, err := e.opts.Classifier.Classify(ctx, *issue)
-			switch {
-			case errors.Is(err, llm.ErrBudgetExhausted):
-				slog.Debug("llm budget exhausted, sending alert without analysis", "detector", issue.Detector)
-			case err != nil:
-				slog.Warn("llm classification failed", "detector", issue.Detector, "container", issue.Container.Name, "error", err)
-			default:
-				issue.Analysis = analysis
-			}
-		}()
-	}
-	wg.Wait()
-}
-
 // mergeSnapshot overlays what an event told us on top of inspect data:
 // by the time we inspect, a restart policy may already have reset the
 // exit code and OOM flag.
@@ -1038,16 +1195,23 @@ func containerName(s dockerclient.ContainerSummary) string {
 
 func toSnapshot(name string, inspect *dockerclient.ContainerInspect) detector.ContainerSnapshot {
 	snap := detector.ContainerSnapshot{
-		ID:           inspect.ID,
-		Name:         name,
-		Status:       inspect.State.Status,
-		RestartCount: inspect.RestartCount,
-		ExitCode:     inspect.State.ExitCode,
-		OOMKilled:    inspect.State.OOMKilled,
-		StartedAt:    parseTime(inspect.State.StartedAt),
-		FinishedAt:   parseTime(inspect.State.FinishedAt),
-		Project:      inspect.Config.Labels[dockerclient.ProjectLabel],
-		Tty:          inspect.Config.Tty,
+		ID:            inspect.ID,
+		Name:          name,
+		Status:        inspect.State.Status,
+		RestartCount:  inspect.RestartCount,
+		ExitCode:      inspect.State.ExitCode,
+		OOMKilled:     inspect.State.OOMKilled,
+		StartedAt:     parseTime(inspect.State.StartedAt),
+		FinishedAt:    parseTime(inspect.State.FinishedAt),
+		Image:         inspect.Config.Image,
+		ImageID:       inspect.Image,
+		Created:       parseTime(inspect.Created),
+		RestartPolicy: restartPolicy(inspect),
+		Labels:        detector.RelevantLabels(inspect.Config.Labels),
+		Tty:           inspect.Config.Tty,
+	}
+	if inspect.HostConfig.Memory > 0 {
+		snap.MemoryMax = uint64(inspect.HostConfig.Memory)
 	}
 	if h := inspect.State.Health; h != nil {
 		snap.HealthStatus = h.Status
@@ -1059,12 +1223,32 @@ func toSnapshot(name string, inspect *dockerclient.ContainerInspect) detector.Co
 	return snap
 }
 
+func restartPolicy(inspect *dockerclient.ContainerInspect) string {
+	rp := inspect.HostConfig.RestartPolicy
+	switch {
+	case rp.Name == "":
+		return ""
+	case rp.MaximumRetryCount > 0:
+		return fmt.Sprintf("%s:%d", rp.Name, rp.MaximumRetryCount)
+	default:
+		return rp.Name
+	}
+}
+
 func parseTime(s string) time.Time {
 	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
+	if err != nil || t.Year() <= 1 {
 		return time.Time{}
 	}
 	return t
+}
+
+func shortID(id string) string {
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
 }
 
 // formatDuration renders a duration the way a person would say it:

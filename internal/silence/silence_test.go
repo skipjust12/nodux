@@ -112,3 +112,32 @@ func TestStore(t *testing.T) {
 		t.Fatal("nil store silences")
 	}
 }
+
+func TestStore_State(t *testing.T) {
+	st := New()
+	now := time.Now()
+	st.now = func() time.Time { return now }
+	s, _ := st.Add(Matcher{Detector: "memory", Container: "api"}, time.Hour, "tuning")
+	st.Add(Matcher{Target: "x"}, time.Minute, "")
+	st.Deploy("web", "shop", now.Add(2*time.Minute))
+	saved, err := st.SaveState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st2 := New()
+	st2.now = func() time.Time { return now.Add(5 * time.Minute) } // the short one and the windows ended meanwhile
+	if err := st2.LoadState(saved); err != nil {
+		t.Fatal(err)
+	}
+	list := st2.List()
+	if len(list) != 1 || list[0].ID != s.ID || list[0].Comment != "tuning" || !list[0].Until.Equal(s.Until) {
+		t.Fatalf("silences = %+v", list)
+	}
+	if len(st2.Windows()) != 0 {
+		t.Fatalf("expired windows restored: %+v", st2.Windows())
+	}
+	if _, ok := st2.Silenced(Subject{Detector: "memory", Container: "api"}); !ok {
+		t.Fatal("restored silence doesn't apply")
+	}
+}
